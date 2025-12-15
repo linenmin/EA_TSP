@@ -1,0 +1,11 @@
+*.csv
+*.pdf
+*.png
+*.jpg
+*.tex
+*.docx
+*.zip
+*.txt
+
+__pycache__
+*.pyc
