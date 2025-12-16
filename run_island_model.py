@@ -177,7 +177,7 @@ def main():
     # 用户配置区域
     # ==============================================================================
     
-    # 选择要运行的文件列表 (按顺序执行)
+    # 选择要运行的文件列表 (并行执行)
     TARGET_FILES = [
         "tour500.csv",
         "tour750.csv",
@@ -190,14 +190,70 @@ def main():
     # ==============================================================================
     
     print("=" * 60)
-    print(f"批量运行模式: {len(TARGET_FILES)} 个问题")
+    print(f"并行运行模式: {len(TARGET_FILES)} 个问题同时运行")
     print(f"问题列表: {TARGET_FILES}")
+    print(f"总进程数: {len(TARGET_FILES) * 2} (每个问题 2 个岛屿)")
     print("=" * 60)
     
-    for i, target_csv in enumerate(TARGET_FILES):
-        print(f"\n[{i+1}/{len(TARGET_FILES)}] 正在运行: {target_csv}")
-        run_single_problem(target_csv, enable_log=ENABLE_DIAGNOSTIC_LOG)
-        print(f"[{i+1}/{len(TARGET_FILES)}] {target_csv} 完成")
+    # 收集所有进程
+    all_processes = []
+    
+    for target_csv in TARGET_FILES:
+        if not os.path.exists(target_csv):
+            print(f"[Warning] {target_csv} not found! Skipping...")
+            continue
+        
+        # 获取配置
+        base_cfg = PROBLEM_CONFIGS.get(target_csv, DEFAULT_CONFIG)
+        cfg0 = apply_role(base_cfg, 0)
+        cfg1 = apply_role(base_cfg, 1)
+        
+        print(f"[{target_csv}] Exploiter: lam={cfg0['lam']}, Explorer: lam={cfg1['lam']}")
+        
+        # 诊断日志
+        if ENABLE_DIAGNOSTIC_LOG:
+            log_0 = f"island_0_{target_csv.replace('.csv', '')}_log.csv"
+            log_1 = f"island_1_{target_csv.replace('.csv', '')}_log.csv"
+        else:
+            log_0 = None
+            log_1 = None
+        
+        # 为每个问题创建独立的通信队列
+        q1 = multiprocessing.Queue(maxsize=10)
+        q2 = multiprocessing.Queue(maxsize=10)
+        
+        # 创建进程
+        p1 = multiprocessing.Process(
+            target=island_worker,
+            args=(0, cfg0, target_csv, q1, q2, log_0),
+            name=f"{target_csv}_Exploiter"
+        )
+        p2 = multiprocessing.Process(
+            target=island_worker,
+            args=(1, cfg1, target_csv, q2, q1, log_1),
+            name=f"{target_csv}_Explorer"
+        )
+        
+        all_processes.extend([p1, p2])
+    
+    print(f"\n启动 {len(all_processes)} 个进程...")
+    
+    try:
+        # 启动所有进程
+        for p in all_processes:
+            p.start()
+        
+        # 等待所有进程完成
+        for p in all_processes:
+            p.join()
+        
+    except KeyboardInterrupt:
+        print("\n[Launcher] 正在停止所有进程...")
+        for p in all_processes:
+            p.terminate()
+        for p in all_processes:
+            p.join()
+        print("[Launcher] 已停止。")
     
     print("\n" + "=" * 60)
     print("所有问题运行完成!")
@@ -208,4 +264,3 @@ if __name__ == "__main__":
     # Windows support for multiprocessing
     multiprocessing.freeze_support()
     main()
-
