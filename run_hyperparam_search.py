@@ -61,7 +61,7 @@ PARAM_GRIDS_BY_FILE = {
     # Medium (500): Transition zone
     "tour500.csv": {
         # 修正：包含更小的种群 (150-500) 以支持 Memetic 搜索
-        "lam": [150, 300, 500, 800],
+        "lam": [150, 200, 300, 400],
         "exploit_mut": [0.2, 0.3], "explore_mut": [0.7, 0.9],
         "exploit_ls_step": [30, 40, 50], "explore_ls_step": [15, 25],
         "exploit_ls_rate": [0.5, 0.8, 1.0], "explore_ls_rate": [0.2, 0.4, 0.6]
@@ -167,10 +167,7 @@ def main():
             writer = csv.writer(f)
             writer.writerow(headers)
             
-    # MAX_PAIRS: 并行度控制
-    # 原来是 18 (36核满载)，但这会导致内存带宽争抢，降低每核的有效算力
-    # 导致 300秒内跑不了几代。降低到 14 (28核) 以留有余地。
-    MAX_PAIRS = 14  
+    MAX_PAIRS = 1  
     
     # --- 2. 遍历每个文件进行搜索 ---
     for filename in TARGET_FILES:
