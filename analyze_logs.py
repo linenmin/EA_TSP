@@ -151,34 +151,39 @@ def print_summary(df0, df1):
     print("=" * 60)
 
 def main():
-    # 自动检测日志文件
-    log_files_0 = [f for f in os.listdir('.') if f.startswith('island_0_') and f.endswith('_log.csv')]
-    log_files_1 = [f for f in os.listdir('.') if f.startswith('island_1_') and f.endswith('_log.csv')]
+    # ==============================================================================
+    # 用户配置区域：手动填入日志文件路径
+    # ==============================================================================
     
-    if not log_files_0 or not log_files_1:
-        print("错误：未找到日志文件！")
-        print("请先运行 run_island_model.py 生成日志。")
-        print("日志文件格式: island_0_tourXXX_log.csv, island_1_tourXXX_log.csv")
+    LOG_0 = "island_0_tour500_log.csv"  # Island 0 (Exploiter) 日志
+    LOG_1 = "island_1_tour500_log.csv"  # Island 1 (Explorer) 日志
+    
+    # 输出文件前缀 (可选，用于区分不同问题的图表)
+    OUTPUT_PREFIX = "tour500_"  # 例如: tour500_convergence.png
+    
+    # ==============================================================================
+    
+    print(f"正在分析: {LOG_0}, {LOG_1}")
+    
+    if not os.path.exists(LOG_0) or not os.path.exists(LOG_1):
+        print(f"错误：日志文件不存在！")
+        print(f"  {LOG_0}: {'存在' if os.path.exists(LOG_0) else '不存在'}")
+        print(f"  {LOG_1}: {'存在' if os.path.exists(LOG_1) else '不存在'}")
         return
     
-    # 使用最新的日志文件
-    log_0 = sorted(log_files_0)[-1]
-    log_1 = sorted(log_files_1)[-1]
+    df0, df1 = load_logs(LOG_0, LOG_1)
     
-    print(f"正在分析: {log_0}, {log_1}")
-    
-    df0, df1 = load_logs(log_0, log_1)
-    
-    # 生成图表
-    plot_convergence(df0, df1)
-    plot_diversity(df0, df1)
-    plot_events(df0, df1)
-    plot_stagnation(df0, df1)
+    # 生成图表 (带前缀)
+    plot_convergence(df0, df1, f"{OUTPUT_PREFIX}convergence.png")
+    plot_diversity(df0, df1, f"{OUTPUT_PREFIX}diversity.png")
+    plot_events(df0, df1, f"{OUTPUT_PREFIX}events.png")
+    plot_stagnation(df0, df1, f"{OUTPUT_PREFIX}stagnation.png")
     
     # 打印摘要
     print_summary(df0, df1)
     
-    print("\n图表已保存: convergence.png, diversity.png, events.png, stagnation.png")
+    print(f"\n图表已保存: {OUTPUT_PREFIX}convergence.png, {OUTPUT_PREFIX}diversity.png, {OUTPUT_PREFIX}events.png, {OUTPUT_PREFIX}stagnation.png")
 
 if __name__ == "__main__":
     main()
+
