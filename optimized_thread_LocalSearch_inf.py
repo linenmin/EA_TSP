@@ -15,9 +15,7 @@ os.environ.setdefault("OMP_NUM_THREADS", "1")
 
 # -------- Numba JIT 配置 (Numba Configuration) --------
 try:
-    from numba import njit, prange, set_num_threads, get_num_threads
-    from numba.np.ufunc.parallel import _get_thread_id
-    import numba.config
+    from numba import njit, prange, set_num_threads
     # 强制要求 Numba 环境，否则报错并退出
     print("Numba imported successfully. JIT compilation enabled.")
 except ImportError:
