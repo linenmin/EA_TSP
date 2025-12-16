@@ -1039,56 +1039,23 @@ class r0123456:
                     while recv_queue is not None:
                         try:
                             guest = recv_queue.get(block=False)
-                        
-                        # === Island Repulsion (互斥机制) ===
-                        # 仅 Explorer (Island 1) 负责避让 Exploiter (Island 0)
-                        if island_id == 1:
-                             # 计算我方最佳个体与来访者的距离
-                             # guest 是对方的最优解
-                            dist = bond_distance_jit(guest, population[best_idx])
                             
-                            # 阈值：如果差异小于 1% 的边，说明俩人在完全相同的坑里
-                            # 注：5%→2%→1% 逐步收紧，避免过度干扰 Explorer
-                            repulsion_threshold = n * 0.01
+                            # Normal Migration (RTR Insertion)
+                            # 使用 RTR 逻辑尝试插入移民
+                            g_fit = tour_length_jit(guest, D)
                             
-                            if dist < repulsion_threshold:
-                                print(f"[Island {island_id}] REPULSION TRIGGERED! Too close to neighbor (Dist: {dist:.1f} < {repulsion_threshold}). Scrambling...")
-                                # 触发排斥：大幅变异当前种群，保留 best_ever 但重置当前种群的搜索方向
-                                # 策略：灾变重启，但这次是“逃离”重启
-                                
-                                seeds = np.empty(self.lam, dtype=np.int64)
-                                for k in range(self.lam): seeds[k] = int(self.rng.integers(1<<30))
-                                strat_probs = np.array([0.1, 0.8, 0.1], dtype=np.float64) # 多用随机插入保持多样性
-                                rcl_r = int(self.rng.integers(5, 15))
-                                
-                                # 重新初始化种群
-                                init_population_jit(population, D, finite_mask, self._knn_idx, strat_probs, seeds, rcl_r)
-                                batch_lengths_jit(population, D, fitness)
-                                
-                                # 重置停滞计数，因为我们刚被迫搬家
-                                self.stagnation_counter = 0
-                                
-                                # 既然都重置了，就没必要把 guest 插入进来了（guest 就在我们刚逃离的那个坑里）
-                                # 但为了礼貌，我们还是可以把 guest 插进去作为反面教材？不，直接跳过。
-                                _repulsion_this_gen = True  # 诊断日志
-                                continue 
-                        
-                        # Normal Migration (RTR Insertion)
-                        # 使用 RTR 逻辑尝试插入移民
-                        g_fit = tour_length_jit(guest, D)
-                        
-                        seed = int(self.rng.integers(0, 1<<30))
-                        better, target_idx = rtr_challenge_jit(
-                            guest, g_fit, population, fitness, W, seed
-                        )
-                        
-                        if better:
-                            population[target_idx][:] = guest[:]
-                            fitness[target_idx] = g_fit
-                            imported_count += 1
-                    except:
-                        # 队列空
-                        break
+                            seed = int(self.rng.integers(0, 1<<30))
+                            better, target_idx = rtr_challenge_jit(
+                                guest, g_fit, population, fitness, W, seed
+                            )
+                            
+                            if better:
+                                population[target_idx][:] = guest[:]
+                                fitness[target_idx] = g_fit
+                                imported_count += 1
+                        except:
+                            # 队列空
+                            break
                 
                 if imported_count > 0:
                     _migration_this_gen = True  # 诊断日志
