@@ -610,8 +610,49 @@ def rtr_challenge_jit(child, child_fit, pop, fit, W, rng_seed):
     return better, target_idx
 
 
+@njit(cache=True, fastmath=True)
+def _double_bridge_jit(tour):
+    """
+    Double Bridge 扰动操作 (4-Opt 变体)。
+    将 tour 切成 4 段并重新拼接，产生 2-Opt 无法达到的结构变化。
+    这是 LKH 算法的核心组件之一。
+    """
+    n = tour.shape[0]
+    if n < 8:
+        return  # 城市太少，不适用
+    
+    # 随机选择 4 个切点 p1 < p2 < p3 < p4
+    # 确保每段至少有 1 个城市
+    p1 = np.random.randint(1, n // 4)
+    p2 = np.random.randint(p1 + 1, n // 2)
+    p3 = np.random.randint(p2 + 1, 3 * n // 4)
+    p4 = n  # 最后一个切点就是数组末尾
+    
+    # 原始 4 段: A=[0:p1], B=[p1:p2], C=[p2:p3], D=[p3:n]
+    # Double Bridge 重组: A + C + B + D (交换 B 和 C)
+    new_tour = np.empty(n, dtype=np.int32)
+    idx = 0
+    
+    # 段 A
+    for i in range(0, p1):
+        new_tour[idx] = tour[i]
+        idx += 1
+    # 段 C
+    for i in range(p2, p3):
+        new_tour[idx] = tour[i]
+        idx += 1
+    # 段 B
+    for i in range(p1, p2):
+        new_tour[idx] = tour[i]
+        idx += 1
+    # 段 D
+    for i in range(p3, n):
+        new_tour[idx] = tour[i]
+        idx += 1
+        
+    tour[:] = new_tour[:]
 
-@njit(cache=True, fastmath=True, parallel=True)
+
 def init_population_jit(pop, D, finite_mask, knn_idx, strat_probs, seeds, rcl_r):
     """
     并行生成初始种群，混合多种构造策略。
@@ -694,6 +735,12 @@ class r0123456:
         n = D.shape[0]
         D = np.ascontiguousarray(D)  # 内存连续化优化
 
+        # 1.5 检查距离矩阵是否对称 (P0: Asymmetry Check)
+        is_symmetric = np.allclose(D, D.T, rtol=1e-5, atol=1e-8, equal_nan=True)
+        if not is_symmetric:
+            print(f"[Island {island_id}] [Warning] Asymmetric TSP detected! Using Or-Opt only.")
+        self._is_symmetric = is_symmetric  # 保存到实例
+
         # 2. 预处理可行性掩码 (True 代表边存在/距离有限)
         finite_mask = np.isfinite(D)
         np.fill_diagonal(finite_mask, False)
@@ -766,11 +813,7 @@ class r0123456:
                 if self.rng.random() < self.mutation_rate:
                     self._hybrid_mutation_inplace(c2)
                     
-                # Local Search
-                if self.rng.random() < self.local_rate:
-                    self._light_two_opt_inplace(c1, D, finite_mask, self.ls_max_steps)
-                if self.rng.random() < self.local_rate:
-                    self._light_two_opt_inplace(c2, D, finite_mask, self.ls_max_steps)
+                # P3 改动：移除了此处的按概率 LS，改为后面的精英优先 LS
                     
                 # Repair
                 self._repair_inplace(c1, D, finite_mask)
@@ -779,8 +822,29 @@ class r0123456:
                 c_pop[i] = c1
                 c_pop[i+1] = c2
             
-            # Evaluation (Batch)
+            # Evaluation (Batch) - 先评估所有子代
             batch_lengths_jit(c_pop, D, c_fit)
+            
+            # --- P3: Elite-Only Local Search (精英优先 LS) ---
+            # 只对适应度前 20% 的子代进行局部搜索，其余保留结构差异
+            elite_ratio = 0.2
+            elite_count = max(1, int(self.lam * elite_ratio))
+            elite_indices = np.argsort(c_fit)[:elite_count]  # 选最好的 20%
+            
+            for idx in elite_indices:
+                # P0 改动：如果非对称，只用 Or-Opt；否则用混合 LS
+                if self._is_symmetric:
+                    self._light_two_opt_inplace(c_pop[idx], D, finite_mask, self.ls_max_steps)
+                else:
+                    # 非对称 TSP：只用 Or-Opt (块移动不改内部边方向)
+                    for _ in range(self.ls_max_steps):
+                        bs = int(self.rng.integers(1, 4))
+                        if not _or_opt_once_jit(c_pop[idx], D, bs):
+                            break
+            
+            # 重新评估被 LS 优化过的个体
+            for idx in elite_indices:
+                c_fit[idx] = tour_length_jit(c_pop[idx], D)
             
             # --- B. RTR Replacement ---
             # 逐个子代尝试替换
@@ -926,24 +990,46 @@ class r0123456:
             # Time check done above
 
         
-        # ==================== Final Polish (High Intensity) ====================
-        print(f"[Island {island_id}] Final Polish: Running heavy local search on best solution...")
+        # ==================== Final Polish (Double Bridge + Deep 2-Opt) ====================
+        print(f"[Island {island_id}] Final Polish: Running Double Bridge + Deep 2-Opt cycles...")
         best_idx = np.argmin(fitness)
         best_tour = population[best_idx].copy()
+        best_fit = tour_length_jit(best_tour, D)
         
-        # 运行长时间的混合局部搜索 (5000 步)
-        # 注意：这里我们可以直接调用 _light_two_opt_inplace，虽然名字带 "light"，但步数设大就是 "heavy"
-        self._light_two_opt_inplace(best_tour, D, finite_mask, max_steps=5000)
+        # Double Bridge 多轮尝试：扰动 -> 深度 2-Opt 优化 -> 检查是否改进
+        # 这能突破 2-Opt 的局部最优陷阱
+        POLISH_ROUNDS = 30  # 增加到 30 轮，给更多逃逸机会
+        DEEP_LS_STEPS = 500  # 每轮扰动后跑 500 步深度优化
         
-        final_fit = tour_length_jit(best_tour, D)
-        if final_fit < self.best_ever_fitness:
-             print(f"[Island {island_id}] Final Polish SUCCESS: {self.best_ever_fitness:.2f} -> {final_fit:.2f}")
-             self.best_ever_fitness = final_fit
-             bestSolution = self._rotate_to_start(best_tour.copy(), 0)
-             # One last report
-             self.reporter.report(final_fit, final_fit, bestSolution)
+        improved = False
+        for r in range(POLISH_ROUNDS):
+            # 保存当前最优的副本
+            candidate = best_tour.copy()
+            
+            # 1. Double Bridge 扰动
+            _double_bridge_jit(candidate)
+            
+            # 2. 深度 2-Opt 优化 (纯 2-Opt，更可靠)
+            for _ in range(DEEP_LS_STEPS):
+                if not _two_opt_once_jit_safe(candidate, D):
+                    break
+            
+            # 3. 评估
+            candidate_fit = tour_length_jit(candidate, D)
+            if candidate_fit < best_fit:
+                best_tour[:] = candidate[:]
+                best_fit = candidate_fit
+                improved = True
+                print(f"[Island {island_id}] Polish Round {r+1}: {self.best_ever_fitness:.2f} -> {best_fit:.2f} (IMPROVED)")
+        
+        if best_fit < self.best_ever_fitness:
+            print(f"[Island {island_id}] Final Polish SUCCESS: {self.best_ever_fitness:.2f} -> {best_fit:.2f}")
+            self.best_ever_fitness = best_fit
+            bestSolution = self._rotate_to_start(best_tour.copy(), 0)
+            # One last report
+            self.reporter.report(best_fit, best_fit, bestSolution)
         else:
-             print(f"[Island {island_id}] Final Polish found no improvement.")
+            print(f"[Island {island_id}] Final Polish found no improvement.")
               
         return 0
 

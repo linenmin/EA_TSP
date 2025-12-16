@@ -29,13 +29,13 @@ PROBLEM_CONFIGS = {
         "N_RUNS": 10_000_000, "lam": 1000, "mu": 1000, "stagnation_limit": 300
     },
     "tour500.csv": {
-        "N_RUNS": 10_000_000, "lam": 500, "mu": 500, "stagnation_limit": 200
+        "N_RUNS": 10_000_000, "lam": 300, "mu": 300, "stagnation_limit": 200
     },
     "tour750.csv": {
-        "N_RUNS": 10_000_000, "lam": 150, "mu": 150, "stagnation_limit": 150
+        "N_RUNS": 10_000_000, "lam": 200, "mu": 200, "stagnation_limit": 100  # 降低到 100
     },
     "tour1000.csv": {
-        "N_RUNS": 10_000_000, "lam": 100, "mu": 100, "stagnation_limit": 150
+        "N_RUNS": 10_000_000, "lam": 100, "mu": 100, "stagnation_limit": 100  # 降低到 100
     }
 }
 
@@ -55,8 +55,8 @@ def apply_role(base_config, role):
         cfg["k_tournament"] = 5     # 高压力
         cfg["mutation_rate"] = 0.3  # 低变异
         # 核心修改：全民皆兵，每个子代都必须经过局部搜索优化
-        cfg["local_rate"] = 1.0     
-        cfg["ls_max_steps"] = 40    # 中深度
+        cfg["local_rate"] = 1     
+        cfg["ls_max_steps"] = 30    # 中深度
         # Stagnation 稍低，为了尽快重启
         cfg["stagnation_limit"] = int(cfg["stagnation_limit"] * 0.8)
         
@@ -100,7 +100,7 @@ def island_worker(island_id, config, csv_file, mig_queue, recv_queue):
 
 def main():
     # --- 用户在此处选择目标文件 ---
-    TARGET_CSV = "tour500.csv"
+    TARGET_CSV = "tour750.csv"
     # TARGET_CSV = "tour500.csv"
     
     print("==================================================")
