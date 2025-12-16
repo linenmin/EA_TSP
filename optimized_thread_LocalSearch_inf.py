@@ -974,17 +974,19 @@ class r0123456:
             
             # --- P3: Elite-Only Local Search (精英优先 LS) ---
             # 只对适应度前 20% 的子代进行局部搜索，其余保留结构差异
-            elite_ratio = 0.2
-            elite_count = max(1, int(self.lam * elite_ratio))
-            elite_indices = np.argsort(c_fit)[:elite_count]  # 选最好的 20%
-            
-            for idx in elite_indices:
-                # P1: 使用候选列表驱动的 Or-Opt，比随机采样快且不漏改进
-                _candidate_or_opt_jit(c_pop[idx], D, knn_idx, max_iters=self.ls_max_steps)
-            
-            # 重新评估被 LS 优化过的个体
-            for idx in elite_indices:
-                c_fit[idx] = tour_length_jit(c_pop[idx], D)
+            # 注：Explorer (island_id=1) 完全跳过 LS，纯探索模式
+            if island_id == 0:  # 只有 Exploiter 做 LS
+                elite_ratio = 0.2
+                elite_count = max(1, int(self.lam * elite_ratio))
+                elite_indices = np.argsort(c_fit)[:elite_count]  # 选最好的 20%
+                
+                for idx in elite_indices:
+                    # P1: 使用候选列表驱动的 Or-Opt，比随机采样快且不漏改进
+                    _candidate_or_opt_jit(c_pop[idx], D, knn_idx, max_iters=self.ls_max_steps)
+                
+                # 重新评估被 LS 优化过的个体
+                for idx in elite_indices:
+                    c_fit[idx] = tour_length_jit(c_pop[idx], D)
             
             # --- B. RTR Replacement ---
             # 逐个子代尝试替换
@@ -1034,9 +1036,9 @@ class r0123456:
                              # guest 是对方的最优解
                             dist = bond_distance_jit(guest, population[best_idx])
                             
-                            # 阈值：如果差异小于 2% 的边，说明俩人在同一个坑里
-                            # 注：5% 过于宽松，导致 tour500 触发 25 次 Repulsion
-                            repulsion_threshold = n * 0.02
+                            # 阈值：如果差异小于 1% 的边，说明俩人在完全相同的坑里
+                            # 注：5%→2%→1% 逐步收紧，避免过度干扰 Explorer
+                            repulsion_threshold = n * 0.01
                             
                             if dist < repulsion_threshold:
                                 print(f"[Island {island_id}] REPULSION TRIGGERED! Too close to neighbor (Dist: {dist:.1f} < {repulsion_threshold}). Scrambling...")
@@ -1096,6 +1098,16 @@ class r0123456:
                 # New Best! Print immediately
                 div_dist, div_ent = calc_diversity_metrics_jit(population, population[best_idx])
                 print(f"Gen {gen:4d} | Best: {bestObjective:.2f} | Div: {div_dist:.1f} | Ent: {div_ent:.3f} (NEW BEST)")
+                
+                # --- Explorer 立即推送机制 ---
+                # 当 Explorer 发现改进时，立即推送给 Exploiter，不等 50 代迁移周期
+                if island_id == 1 and mig_queue is not None:
+                    migrant = population[best_idx].copy()
+                    try:
+                        mig_queue.put(migrant, block=False)
+                        print(f"[Island {island_id}] Immediate push: found improvement, sending to Exploiter")
+                    except:
+                        pass  # 队列满则丢弃
                 
             else:
                 self.stagnation_counter += 1
