@@ -39,46 +39,35 @@ LOG_FILE = "hpc_grid_search_results.csv"
 NUM_TRIALS_PER_FILE = 36
 
 # 不同文件大小对应不同的搜索范围
-# 定则：小图搜大种群，大图搜小种群 (Memetic)
-
-# ... (PARAM_GRIDS_BY_FILE definition)
-# 不同文件大小对应不同的搜索范围
-# 定则：小图搜大种群，大图搜小种群 (Memetic)
+# ⭐ OX + Candidate-Or-Opt 版本：
+# - local_rate 已废弃 (现在用精英优先策略，固定只对 20% 子代做 LS)
+# - ls_step 现在是 _candidate_or_opt_jit 的 max_iters
 PARAM_GRIDS_BY_FILE = {
-    # Tiny & Small (50-250): brute force diversity
     "tour50.csv": {
-        "lam": [2000, 5000, 10000, 20000],
+        "lam": [2000, 5000, 8000],
         "exploit_mut": [0.2, 0.3], "explore_mut": [0.7, 0.9],
-        "exploit_ls_step": [20, 30], "explore_ls_step": [10, 20],
-        "exploit_ls_rate": [0.2, 0.4], "explore_ls_rate": [0.1, 0.2]
+        "exploit_ls_step": [20, 30, 50], "explore_ls_step": [10, 20]
     },
     "tour250.csv": {
-        "lam": [1000, 2000, 3000, 5000],
+        "lam": [300, 500, 800, 1000],
         "exploit_mut": [0.2, 0.3], "explore_mut": [0.7, 0.9],
-        "exploit_ls_step": [30, 40], "explore_ls_step": [10, 20],
-        "exploit_ls_rate": [0.2, 0.4], "explore_ls_rate": [0.1, 0.2]
+        "exploit_ls_step": [30, 50], "explore_ls_step": [15, 25]
     },
-    # Medium (500): Transition zone
     "tour500.csv": {
-        # 修正：包含更小的种群 (150-500) 以支持 Memetic 搜索
-        "lam": [150, 200, 300, 400],
-        "exploit_mut": [0.2, 0.3], "explore_mut": [0.7, 0.9],
-        "exploit_ls_step": [30, 40, 50], "explore_ls_step": [15, 25],
-        "exploit_ls_rate": [0.5, 0.8, 1.0], "explore_ls_rate": [0.2, 0.4, 0.6]
+        # 基于测试结果: lam=200, ls=30 可跑 10000+ 代
+        "lam": [150, 200, 250, 300],
+        "exploit_mut": [0.2, 0.3, 0.4], "explore_mut": [0.6, 0.8],
+        "exploit_ls_step": [20, 30, 40], "explore_ls_step": [10, 15, 20]
     },
-    # Large (750-1000): Memetic (High Quality, Low Quantity)
     "tour750.csv": {
-        "lam": [100, 120, 150, 200],
-        "exploit_mut": [0.2, 0.3, 0.4], "explore_mut": [0.7, 0.8, 0.9],
-        "exploit_ls_step": [40, 50, 60], "explore_ls_step": [15, 20, 30],
-        "exploit_ls_rate": [0.8, 1.0], "explore_ls_rate": [0.4, 0.6]
+        "lam": [100, 150, 200],
+        "exploit_mut": [0.2, 0.3, 0.4], "explore_mut": [0.6, 0.8],
+        "exploit_ls_step": [20, 30, 40], "explore_ls_step": [10, 15]
     },
     "tour1000.csv": {
-         # 1000城非常吃力，尝试极简种群
-        "lam": [50, 80, 100, 150],
-        "exploit_mut": [0.2, 0.3, 0.4], "explore_mut": [0.7, 0.8, 0.9],
-        "exploit_ls_step": [40, 50, 60], "explore_ls_step": [15, 20, 30],
-        "exploit_ls_rate": [0.8, 1.0], "explore_ls_rate": [0.4, 0.6]
+        "lam": [80, 100, 120],
+        "exploit_mut": [0.2, 0.3, 0.4], "explore_mut": [0.6, 0.8],
+        "exploit_ls_step": [20, 30], "explore_ls_step": [10, 15]
     }
 }
 

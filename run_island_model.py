@@ -20,22 +20,24 @@ from optimized_thread_LocalSearch_inf import r0123456
 # 1. 基础问题配置 (Base Configs per Problem)
 # ==============================================================================
 # 策略：Memetic Evolution (文化基因进化)
-# 为了支持高频局部搜索 (Quality)，必须大幅缩减种群 (Quantity)。
+# OX + Candidate-Or-Opt 大幅提速，可以跑更多代数
+# stagnation_limit 相应提高，因为现在每代更快
 PROBLEM_CONFIGS = {
     "tour50.csv": {
-        "N_RUNS": 10_000_000, "lam": 10000, "mu": 10000, "stagnation_limit": 500
+        "N_RUNS": 10_000_000, "lam": 5000, "mu": 5000, "stagnation_limit": 800
     },
     "tour250.csv": {
-        "N_RUNS": 10_000_000, "lam": 1000, "mu": 1000, "stagnation_limit": 300
+        "N_RUNS": 10_000_000, "lam": 500, "mu": 500, "stagnation_limit": 400
     },
     "tour500.csv": {
-        "N_RUNS": 10_000_000, "lam": 300, "mu": 300, "stagnation_limit": 200
+        # OX+Candidate-OrOpt 5min 可跑 10000+ 代，stagnation 可设高点
+        "N_RUNS": 10_000_000, "lam": 200, "mu": 200, "stagnation_limit": 300
     },
     "tour750.csv": {
-        "N_RUNS": 10_000_000, "lam": 200, "mu": 200, "stagnation_limit": 100  # 降低到 100
+        "N_RUNS": 10_000_000, "lam": 150, "mu": 150, "stagnation_limit": 200
     },
     "tour1000.csv": {
-        "N_RUNS": 10_000_000, "lam": 100, "mu": 100, "stagnation_limit": 100  # 降低到 100
+        "N_RUNS": 10_000_000, "lam": 100, "mu": 100, "stagnation_limit": 150
     }
 }
 
@@ -100,7 +102,7 @@ def island_worker(island_id, config, csv_file, mig_queue, recv_queue):
 
 def main():
     # --- 用户在此处选择目标文件 ---
-    TARGET_CSV = "tour750.csv"
+    TARGET_CSV = "tour500.csv"
     # TARGET_CSV = "tour500.csv"
     
     print("==================================================")
