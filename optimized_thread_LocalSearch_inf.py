@@ -835,7 +835,8 @@ class r0123456:
                  rng_seed: Optional[int] = None, # 随机种子
                  local_rate: float = 0.2,     # 局部搜索概率
                  ls_max_steps: int = 30,      # 局部搜索最大步数
-                 stagnation_limit: int = 150):# 停滞阈值（用于灾变）
+                 stagnation_limit: int = 150, # 停滞阈值（用于灾变）
+                 log_file: Optional[str] = None):  # 诊断日志文件路径
         
         self.reporter = Reporter.Reporter(self.__class__.__name__)
         
@@ -853,6 +854,10 @@ class r0123456:
         # 停滞检测状态
         self.best_ever_fitness = np.inf
         self.stagnation_counter = 0
+        
+        # 诊断日志
+        self.log_file = log_file
+        self._log_handle = None
 
     def optimize(self, filename: str, mig_queue=None, recv_queue=None, island_id=0):
         """
@@ -920,6 +925,18 @@ class r0123456:
         # 窗口大小
         W = min(self.lam, 20)
         
+        # --- 诊断日志初始化 ---
+        if self.log_file:
+            self._log_handle = open(self.log_file, 'w', encoding='utf-8')
+            # CSV Header
+            self._log_handle.write("gen,best_fit,mean_fit,diversity,entropy,stagnation,migration,repulsion,rtr_accepts\n")
+            self._log_handle.flush()
+        
+        # 运行时追踪变量
+        _migration_this_gen = False
+        _repulsion_this_gen = False
+        _rtr_accepts = 0
+        
         print("Gen | Best Cost | Avg Bonds | Edge Ent", flush=True)
 
         # ==================== 进化循环 (Evolution Loop: RTR) ====================
@@ -986,6 +1003,7 @@ class r0123456:
                 if better:
                     population[target_idx][:] = c_pop[i][:]
                     fitness[target_idx] = c_fit[i]
+                    _rtr_accepts += 1  # 诊断日志：记录 RTR 接受数
 
             # --- D. Migration (Island Model) ---
             # Pre-calc best_idx for export
@@ -1038,6 +1056,7 @@ class r0123456:
                                 
                                 # 既然都重置了，就没必要把 guest 插入进来了（guest 就在我们刚逃离的那个坑里）
                                 # 但为了礼貌，我们还是可以把 guest 插进去作为反面教材？不，直接跳过。
+                                _repulsion_this_gen = True  # 诊断日志
                                 continue 
                         
                         # Normal Migration (RTR Insertion)
@@ -1058,7 +1077,8 @@ class r0123456:
                         break
                 
                 if imported_count > 0:
-                     print(f"[Island {island_id}] Imported {imported_count} migrants.")
+                    _migration_this_gen = True  # 诊断日志
+                    print(f"[Island {island_id}] Imported {imported_count} migrants.")
 
             # --- E. Reporting & Metrics ---
             # best_idx 已经在上面更新过
@@ -1087,6 +1107,21 @@ class r0123456:
             # --- Call Reporter (Time Check & CSV Log) ---
             # 必须每代调用，以检查时间并记录 CSV
             timeLeft = self.reporter.report(meanObjective, bestObjective, bestSolution)
+            
+            # --- 诊断日志: 写入 CSV 行 ---
+            if self._log_handle:
+                # 需要计算 diversity 指标 (如果还没计算过)
+                if 'div_dist' not in dir() or gen % 50 != 0:
+                    div_dist, div_ent = calc_diversity_metrics_jit(population, population[best_idx])
+                row = f"{gen},{bestObjective:.4f},{meanObjective:.4f},{div_dist:.2f},{div_ent:.4f},{self.stagnation_counter},{int(_migration_this_gen)},{int(_repulsion_this_gen)},{_rtr_accepts}\n"
+                self._log_handle.write(row)
+                if gen % 50 == 0:  # 每 50 代 flush 一次
+                    self._log_handle.flush()
+                # 重置每代计数器
+                _migration_this_gen = False
+                _repulsion_this_gen = False
+                _rtr_accepts = 0
+            
             if timeLeft < 0:
                 print(f"[Island {island_id}] Time limit reached. Stopping.")
                 break
@@ -1153,6 +1188,11 @@ class r0123456:
             self.reporter.report(best_fit, best_fit, bestSolution)
         else:
             print(f"[Island {island_id}] Final Polish found no improvement.")
+        
+        # --- 关闭诊断日志 ---
+        if self._log_handle:
+            self._log_handle.close()
+            self._log_handle = None
               
         return 0
 

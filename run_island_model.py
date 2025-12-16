@@ -19,61 +19,73 @@ from optimized_thread_LocalSearch_inf import r0123456
 # ==============================================================================
 # 1. 基础问题配置 (Base Configs per Problem)
 # ==============================================================================
-# 策略：Memetic Evolution (文化基因进化)
-# OX + Candidate-Or-Opt 大幅提速，可以跑更多代数
-# stagnation_limit 相应提高，因为现在每代更快
+# 策略：根据 HPC 超参搜索结果，为每个问题设置最优参数
+# 搜索日期: 2024-12-16
+# ==============================================================================
 PROBLEM_CONFIGS = {
     "tour50.csv": {
-        "N_RUNS": 10_000_000, "lam": 5000, "mu": 5000, "stagnation_limit": 800
+        "N_RUNS": 10_000_000, "lam": 5000, "stagnation_limit": 800,
+        # 岛屿特定参数 (默认值，小问题不需要精细调参)
+        "exploit_mut": 0.3, "explore_mut": 0.8,
+        "exploit_ls": 30, "explore_ls": 15
     },
     "tour250.csv": {
-        "N_RUNS": 10_000_000, "lam": 500, "mu": 500, "stagnation_limit": 400
+        "N_RUNS": 10_000_000, "lam": 500, "stagnation_limit": 400,
+        "exploit_mut": 0.3, "explore_mut": 0.8,
+        "exploit_ls": 30, "explore_ls": 15
     },
     "tour500.csv": {
-        # OX+Candidate-OrOpt 5min 可跑 10000+ 代，stagnation 可设高点
-        "N_RUNS": 10_000_000, "lam": 200, "mu": 200, "stagnation_limit": 300
+        # HPC 最佳: 99562 (run 4)
+        "N_RUNS": 10_000_000, "lam": 300, "stagnation_limit": 300,
+        "exploit_mut": 0.4, "explore_mut": 0.6,
+        "exploit_ls": 40, "explore_ls": 15
     },
     "tour750.csv": {
-        "N_RUNS": 10_000_000, "lam": 150, "mu": 150, "stagnation_limit": 200
+        # HPC 最佳: 116363 (run 27)
+        "N_RUNS": 10_000_000, "lam": 150, "stagnation_limit": 200,
+        "exploit_mut": 0.4, "explore_mut": 0.8,
+        "exploit_ls": 30, "explore_ls": 10
     },
     "tour1000.csv": {
-        "N_RUNS": 10_000_000, "lam": 100, "mu": 100, "stagnation_limit": 150
+        # HPC 最佳: 63848 (run 1)
+        "N_RUNS": 10_000_000, "lam": 100, "stagnation_limit": 150,
+        "exploit_mut": 0.2, "explore_mut": 0.6,
+        "exploit_ls": 30, "explore_ls": 15
     }
 }
 
 # 默认配置 (如果不匹配)
-DEFAULT_CONFIG = {"N_RUNS": 10_000_000, "lam": 200, "mu": 200, "stagnation_limit": 200}
+DEFAULT_CONFIG = {
+    "N_RUNS": 10_000_000, "lam": 200, "stagnation_limit": 200,
+    "exploit_mut": 0.3, "explore_mut": 0.8, "exploit_ls": 30, "explore_ls": 15
+}
 
 # ==============================================================================
 # 2. 岛屿角色修正 (Role Modifiers)
 # ==============================================================================
 def apply_role(base_config, role):
     """
-    根据岛屿角色 (0=Exploiter, 1=Explorer) 修改基础配置。
+    根据岛屿角色 (0=Exploiter, 1=Explorer) 应用问题特定的配置。
     """
-    cfg = base_config.copy()
+    cfg = {"N_RUNS": base_config["N_RUNS"], "lam": base_config["lam"], "mu": base_config["lam"]}
     
-    if role == 0: # Exploiter (精耕细作)
-        cfg["k_tournament"] = 5     # 高压力
-        cfg["mutation_rate"] = 0.3  # 低变异
-        # 核心修改：全民皆兵，每个子代都必须经过局部搜索优化
-        cfg["local_rate"] = 1     
-        cfg["ls_max_steps"] = 30    # 中深度
-        # Stagnation 稍低，为了尽快重启
-        cfg["stagnation_limit"] = int(cfg["stagnation_limit"] * 0.8)
+    if role == 0:  # Exploiter (精耕细作)
+        cfg["k_tournament"] = 5
+        cfg["mutation_rate"] = base_config["exploit_mut"]
+        cfg["local_rate"] = 1.0  # 精英优先策略已内置
+        cfg["ls_max_steps"] = base_config["exploit_ls"]
+        cfg["stagnation_limit"] = int(base_config["stagnation_limit"] * 0.8)
         
-    else: # Explorer (疯狂探索)
-        cfg["k_tournament"] = 2     # 低压力 (接近随机)
-        cfg["mutation_rate"] = 0.8  # 极高变异
-        # 探索者也要优化，否则生成的垃圾解没有意义，只是步数少点
-        cfg["local_rate"] = 0.6     
-        cfg["ls_max_steps"] = 15    # 浅搜
-        # Stagnation 稍高，允许流浪
-        cfg["stagnation_limit"] = int(cfg["stagnation_limit"] * 1.5)
+    else:  # Explorer (疯狂探索)
+        cfg["k_tournament"] = 2
+        cfg["mutation_rate"] = base_config["explore_mut"]
+        cfg["local_rate"] = 0.6
+        cfg["ls_max_steps"] = base_config["explore_ls"]
+        cfg["stagnation_limit"] = int(base_config["stagnation_limit"] * 1.5)
         
     return cfg
 
-def island_worker(island_id, config, csv_file, mig_queue, recv_queue):
+def island_worker(island_id, config, csv_file, mig_queue, recv_queue, log_file=None):
     """
     Worker function for a single island process.
     """
@@ -92,30 +104,27 @@ def island_worker(island_id, config, csv_file, mig_queue, recv_queue):
         local_rate=config["local_rate"],
         ls_max_steps=config["ls_max_steps"],
         stagnation_limit=config["stagnation_limit"],
-        rng_seed=seed
+        rng_seed=seed,
+        log_file=log_file  # 诊断日志文件
     )
     
     # Run optimization (blocking)
     solver.optimize(csv_file, mig_queue=mig_queue, recv_queue=recv_queue, island_id=island_id)
     
     print(f"[Launcher] Island {island_id} finished.")
-
-def main():
-    # --- 用户在此处选择目标文件 ---
-    TARGET_CSV = "tour500.csv"
-    # TARGET_CSV = "tour500.csv"
-    
-    print("==================================================")
+def run_single_problem(target_csv, enable_log=True):
+    """运行单个问题的双岛屿模型"""
+    print("=" * 60)
     print(f"Starting Parallel Island Model (2 Islands)")
-    print(f"Target: {TARGET_CSV}")
-    print("==================================================")
+    print(f"Target: {target_csv}")
+    print("=" * 60)
     
-    if not os.path.exists(TARGET_CSV):
-        print(f"Error: {TARGET_CSV} not found!")
+    if not os.path.exists(target_csv):
+        print(f"Error: {target_csv} not found! Skipping...")
         return
-
+    
     # 获取基础配置
-    base_cfg = PROBLEM_CONFIGS.get(TARGET_CSV, DEFAULT_CONFIG)
+    base_cfg = PROBLEM_CONFIGS.get(target_csv, DEFAULT_CONFIG)
     
     # 生成岛屿专属配置
     cfg0 = apply_role(base_cfg, 0)
@@ -125,29 +134,32 @@ def main():
     print(f"Config 1 (Explorer):  lam={cfg1['lam']}, mut={cfg1['mutation_rate']}, ls={cfg1['ls_max_steps']}")
 
     # Create communication queues
-    # q1: Island 0 -> Island 1
-    # q2: Island 1 -> Island 0
     q1 = multiprocessing.Queue(maxsize=10)
     q2 = multiprocessing.Queue(maxsize=10)
+    
+    # 诊断日志文件路径
+    if enable_log:
+        log_0 = f"island_0_{target_csv.replace('.csv', '')}_log.csv"
+        log_1 = f"island_1_{target_csv.replace('.csv', '')}_log.csv"
+        print(f"[Diagnostic] Logs: {log_0}, {log_1}")
+    else:
+        log_0 = None
+        log_1 = None
     
     # Define processes
     p1 = multiprocessing.Process(
         target=island_worker,
-        args=(0, cfg0, TARGET_CSV, q1, q2) 
+        args=(0, cfg0, target_csv, q1, q2, log_0) 
     )
     
     p2 = multiprocessing.Process(
         target=island_worker,
-        args=(1, cfg1, TARGET_CSV, q2, q1) 
+        args=(1, cfg1, target_csv, q2, q1, log_1) 
     )
 
-    
     try:
         p1.start()
         p2.start()
-        
-        # Wait for them? Or just let them run?
-        # Typically we wait
         p1.join()
         p2.join()
         
@@ -159,7 +171,41 @@ def main():
         p2.join()
         print("[Launcher] Stopped.")
 
+
+def main():
+    # ==============================================================================
+    # 用户配置区域
+    # ==============================================================================
+    
+    # 选择要运行的文件列表 (按顺序执行)
+    TARGET_FILES = [
+        "tour500.csv",
+        "tour750.csv",
+        "tour1000.csv",
+    ]
+    
+    # 是否启用诊断日志
+    ENABLE_DIAGNOSTIC_LOG = True
+    
+    # ==============================================================================
+    
+    print("=" * 60)
+    print(f"批量运行模式: {len(TARGET_FILES)} 个问题")
+    print(f"问题列表: {TARGET_FILES}")
+    print("=" * 60)
+    
+    for i, target_csv in enumerate(TARGET_FILES):
+        print(f"\n[{i+1}/{len(TARGET_FILES)}] 正在运行: {target_csv}")
+        run_single_problem(target_csv, enable_log=ENABLE_DIAGNOSTIC_LOG)
+        print(f"[{i+1}/{len(TARGET_FILES)}] {target_csv} 完成")
+    
+    print("\n" + "=" * 60)
+    print("所有问题运行完成!")
+    print("=" * 60)
+
+
 if __name__ == "__main__":
     # Windows support for multiprocessing
     multiprocessing.freeze_support()
     main()
+
