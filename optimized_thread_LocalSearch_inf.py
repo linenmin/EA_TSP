@@ -1034,8 +1034,9 @@ class r0123456:
                              # guest 是对方的最优解
                             dist = bond_distance_jit(guest, population[best_idx])
                             
-                            # 阈值：如果差异小于 5% 的边，说明俩人在同一个坑里
-                            repulsion_threshold = n * 0.05
+                            # 阈值：如果差异小于 2% 的边，说明俩人在同一个坑里
+                            # 注：5% 过于宽松，导致 tour500 触发 25 次 Repulsion
+                            repulsion_threshold = n * 0.02
                             
                             if dist < repulsion_threshold:
                                 print(f"[Island {island_id}] REPULSION TRIGGERED! Too close to neighbor (Dist: {dist:.1f} < {repulsion_threshold}). Scrambling...")

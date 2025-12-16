@@ -41,10 +41,11 @@ PROBLEM_CONFIGS = {
         "exploit_ls": 40, "explore_ls": 15
     },
     "tour750.csv": {
-        # HPC 最佳: 116363 (run 27)
-        "N_RUNS": 10_000_000, "lam": 150, "stagnation_limit": 200,
+        # 诊断发现: 400 代不足，需要更多代数
+        # 方案: 减小 λ (150→100), 减少 LS 步数 (30→20)
+        "N_RUNS": 10_000_000, "lam": 100, "stagnation_limit": 200,
         "exploit_mut": 0.4, "explore_mut": 0.8,
-        "exploit_ls": 30, "explore_ls": 10
+        "exploit_ls": 20, "explore_ls": 10
     },
     "tour1000.csv": {
         # HPC 最佳: 63848 (run 1)
