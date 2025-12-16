@@ -258,6 +258,97 @@ def _rand_perm_jit(n):
 
 
 @njit(cache=True, fastmath=True)
+def _or_opt_once_jit(tour, D, block_size):
+    """
+    尝试一次 Or-Opt (Block Shift) 移动。
+    移动一个长度为 block_size 的片段到新位置。
+    JIT 优化版。
+    """
+    n = tour.shape[0]
+    
+    # 随机化 block 起点
+    start_node = np.random.randint(0, n)
+    
+    for i_offset in range(n):
+        i = (start_node + i_offset) % n
+        
+        # 只处理不跨越数组边界的 block (简化逻辑，对随机起点足够)
+        if i + block_size >= n: continue
+        
+        # 定义 block: [i ... i+BS-1]
+        # 原始连接: A(i-1) -> B(i) 和 C(i+BS-1) -> D(i+BS)
+        
+        prev_idx = i - 1
+        if prev_idx < 0: prev_idx = n - 1
+        
+        post_idx = i + block_size
+        if post_idx >= n: post_idx = 0
+        
+        A = tour[prev_idx]
+        B = tour[i]
+        C = tour[i + block_size - 1]
+        D_node = tour[post_idx] # D keyword conflict
+        
+        # 移除代价: -AB -CD +AD
+        if not (np.isfinite(D[A, B]) and np.isfinite(D[C, D_node]) and np.isfinite(D[A, D_node])):
+            continue
+            
+        remove_gain = D[A, B] + D[C, D_node] - D[A, D_node]
+        
+        # 扫描插入位置 j
+        # j 不能在 block 内部，也不能是 prev_idx
+        for j in range(n):
+            if j >= i - 1 and j < i + block_size:
+                continue
+                
+            # 插入到 j 和 j+1 之间
+            # X(j) -> Y(j+1)
+            # 变为: X -> B...C -> Y
+            
+            j_next = j + 1
+            if j_next >= n: j_next = 0
+            
+            X = tour[j]
+            Y = tour[j_next]
+            
+            if not (np.isfinite(D[X, Y]) and np.isfinite(D[X, B]) and np.isfinite(D[C, Y])):
+                continue
+                
+            # gain = remove_gain + XY - XB - CY
+            gain = remove_gain + D[X, Y] - D[X, B] - D[C, Y]
+            
+            if gain > 1e-6:
+                # 执行移动 (非 inplace，使用 buffer)
+                # 构造新 tour
+                new_tour = np.empty_like(tour)
+                idx = 0
+                
+                # 复制 0..j
+                # 注意 j 可能在 i 前或后，逻辑要通用
+                # 我们遍历原 tour 的所有非 block 元素
+                
+                # 优化: 手动 loop
+                for k in range(n):
+                    # 跳过 block
+                    if k >= i and k < i + block_size:
+                        continue
+                        
+                    new_tour[idx] = tour[k]
+                    idx += 1
+                    
+                    if k == j: # 在 j 后面插入 block
+                        # 插入 block
+                        for b_idx in range(i, i + block_size):
+                            new_tour[idx] = tour[b_idx]
+                            idx += 1
+                            
+                tour[:] = new_tour[:]
+                return True
+                
+    return False
+
+
+@njit(cache=True, fastmath=True)
 def _rcl_nn_tour_jit(D, finite_mask, knn_idx, r):
     """
     基于 RCL (Restricted Candidate List) 的最近邻构造初始化。
@@ -401,6 +492,119 @@ def _insertion_tour_jit(D, finite_mask, use_farthest):
     return tour
 
 
+@njit(cache=True, fastmath=True)
+def bond_distance_jit(t1, t2):
+    """
+    计算两个路径之间的Bond Distance（差异边数量）。
+    Bond Distance = N - |Edges(t1) ∩ Edges(t2)|
+    用于 Deterministic Crowding 中的距离度量。
+    """
+    n = t1.shape[0]
+    # 构建 t2 的边查找表 (或直接索引查找)
+    # 为了 O(N) 效率，先构建 t2 的位置映射 pos2[city] = index
+    pos2 = np.empty(n, np.int32)
+    for i in range(n):
+        pos2[t2[i]] = i
+        
+    shared_edges = 0
+    for i in range(n):
+        u = t1[i]
+        v = t1[(i + 1) % n]
+        
+        # 在 t2 中检查是否存在边 (u, v)
+        # u 在 t2 中的位置
+        idx_u = pos2[u]
+        
+        # u 在 t2 中的左右邻居
+        left = t2[(idx_u - 1) % n]
+        right = t2[(idx_u + 1) % n]
+        
+        if v == left or v == right:
+            shared_edges += 1
+            
+    return n - shared_edges
+
+
+@njit(cache=True, fastmath=True, parallel=True)
+def calc_diversity_metrics_jit(pop, best_tour):
+    """
+    计算多样性指标：
+    1. avg_dist: 种群与当前最优解的平均 Bond Distance
+    2. entropy: 种群的边熵 (Edge Entropy)
+    """
+    m, n = pop.shape
+    
+    # --- 1. Average Bond Distance to Best ---
+    total_dist = 0.0
+    for i in prange(m):
+         # bond_distance_jit 计算的是“不一样的边数”
+        total_dist += bond_distance_jit(pop[i], best_tour)
+    avg_dist = total_dist / m
+    
+    # --- 2. Edge Entropy ---
+    # counts[i, j] 记录边 i->j 出现的次数
+    # 空间 O(N^2)
+    counts = np.zeros((n, n), dtype=np.int32)
+    
+    # 填充计数矩阵 (并行化需小心，这里用串行或原子操作，为简单起见用简单的循环)
+    # 为保证效率，我们在外层串行，内层遍历边
+    for i in range(m):
+        t = pop[i]
+        for j in range(n):
+            u = t[j]
+            v = t[(j + 1) % n]
+            counts[u, v] += 1
+            counts[v, u] += 1 # 无向图视角
+            
+    # 计算熵
+    entropy = 0.0
+    for i in range(n):
+        for j in range(i + 1, n): # 只算上三角
+            c = counts[i, j]
+            if c > 0:
+                p = c / m
+                entropy -= p * np.log(p)
+                
+    return avg_dist, entropy
+
+
+@njit(cache=True, fastmath=True)
+def rtr_challenge_jit(child, child_fit, pop, fit, W, rng_seed):
+    """
+    RTR (Restricted Tournament Replacement) 单个挑战逻辑
+    child: 子代
+    pop: 当前种群
+    W: 窗口大小
+    """
+    m = pop.shape[0]
+    np.random.seed(rng_seed)
+    
+    # 1. 随机选择 W 个窗口个体
+    window_indices = np.random.choice(m, size=W, replace=False)
+    
+    # 2. 找到窗口中最像 child 的那个 (Bond Distance 最小)
+    closest_idx = -1
+    min_dist = 99999999
+    
+    for idx in window_indices:
+        dist = bond_distance_jit(child, pop[idx])
+        if dist < min_dist:
+            min_dist = dist
+            closest_idx = idx
+            
+    # 3. 竞争：如果 child 更强 (距离越短 fit 越小)，则替换
+    # 注意：我们这里只返回是否替换和替换位置，实际替换在外部做
+    target_idx = closest_idx
+    target_fit = fit[target_idx]
+    
+    better = False
+    if child_fit < target_fit:
+        better = True
+        
+    return better, target_idx
+
+
+
 @njit(cache=True, fastmath=True, parallel=True)
 def init_population_jit(pop, D, finite_mask, knn_idx, strat_probs, seeds, rcl_r):
     """
@@ -473,9 +677,10 @@ class r0123456:
         self.best_ever_fitness = np.inf
         self.stagnation_counter = 0
 
-    def optimize(self, filename: str):
+    def optimize(self, filename: str, mig_queue=None, recv_queue=None, island_id=0):
         """
         主优化流程：读取文件 -> 初始化 -> 进化循环 -> 上报结果
+        mig_queue, recv_queue: 用于岛屿模型的多进程通信 (Optional)
         """
         # 1. 读取数据
         with open(filename) as file:
@@ -492,10 +697,10 @@ class r0123456:
         
         # 4. 构建 KNN 索引 (用于加速初始化)
         K = 32
-        print(f"[Init] Building KNN (K={K}) for {n} cities...")
+        print(f"[Island {island_id}] [Init] Building KNN (K={K}) for {n} cities...")
         knn_idx = build_knn_idx(D, finite_mask, K)
         self._knn_idx = knn_idx  # 保存引用
-        print("[Init] KNN ready.")
+        print(f"[Island {island_id}] [Init] KNN ready.")
 
         # 5. 生成初始种群 (并行)
         strat_probs = np.array([0.1, 0.3, 0.6], dtype=np.float64) # RCL / Insert / Rand
@@ -512,164 +717,196 @@ class r0123456:
         fitness = np.empty(self.lam, dtype=np.float64)
         batch_lengths_jit(population, D, fitness)
 
-        # 7. 预分配子代缓冲区
-        off_count = self.mu
-        offspring = np.empty((off_count, n), dtype=np.int32)
-        offspring_f = np.empty(off_count, dtype=np.float64)
+        # 7. RTR (Restricted Tournament Replacement) Setup
+        print(f"[Info] Using Restricted Tournament Replacement (RTR). W=20.")
         
-        # 8. 预分配合并缓冲区 (用于截断选择)
-        union_size = self.lam + self.mu
-        union_fit = np.empty(union_size, dtype=np.float64)
+        # 预分配 offspring buffer (batch size = lam or smaller chunk)
+        # 为方便与 JIT 配合并保持逻辑清晰，我们生成一整代子代，然后逐个进行 RTR 竞争
+        # 注意：RTR 通常是稳态的 (steady-state)，即生成一个插入一个。
+        # 但为了利用 JIT 并行繁殖，我们采用 "Batch RTR"：
+        # 1. 并行生成 lambda 个子代
+        # 2. 串行（或部分并行）将子代尝试插入种群
+        
+        # 子代缓冲区
+        c_pop = np.empty((self.lam, n), dtype=np.int32)
+        c_fit = np.empty(self.lam, dtype=np.float64)
+        
+        # 父代索引 (用于繁殖选择)
+        indices = np.arange(self.lam, dtype=np.int32)
+        
+        # 窗口大小
+        W = min(self.lam, 20)
+        
+        print("Gen | Best Cost | Avg Bonds | Edge Ent", flush=True)
 
-        print("generation,best_cost", flush=True)
-
-        # ==================== 进化循环 (Evolution Loop) ====================
+        # ==================== 进化循环 (Evolution Loop: RTR) ====================
         for gen in range(1, self.N_RUNS + 1):
             
-            # --- A. 繁殖阶段 (Reproduction) ---
-            o = 0
-            while o < off_count:
-                # 锦标赛选择父代
-                p1 = population[self._k_tournament_idx(fitness, self.k_tournament)]
-                p2 = population[self._k_tournament_idx(fitness, self.k_tournament)]
+            # --- A. 繁殖 (Reproduction) ---
+            # 使用锦标赛选择父代 (Tournament Selection)以增加选择压力
+            # RTR 的替换已有压力，但在繁殖端施加压力能加速优良基因的扩散
+            
+            for i in range(0, self.lam - 1, 2):
+                idx1 = self._k_tournament_idx(fitness, self.k_tournament)
+                idx2 = self._k_tournament_idx(fitness, self.k_tournament)
                 
-                # 交叉 (ERX)
-                c1 = self._erx(p1, p2)
-                c2 = self._erx(p2, p1)
+                # Crossover
+                c1 = self._erx(population[idx1], population[idx2])
+                c2 = self._erx(population[idx2], population[idx1])
                 
-                # 变异 (Inversion / Insertion)
+                # Mutation
                 if self.rng.random() < self.mutation_rate:
                     self._hybrid_mutation_inplace(c1)
                 if self.rng.random() < self.mutation_rate:
                     self._hybrid_mutation_inplace(c2)
                     
-                # 局部搜索 (Light 2-opt)
+                # Local Search
                 if self.rng.random() < self.local_rate:
                     self._light_two_opt_inplace(c1, D, finite_mask, self.ls_max_steps)
                 if self.rng.random() < self.local_rate:
                     self._light_two_opt_inplace(c2, D, finite_mask, self.ls_max_steps)
                     
-                # 简单的可行性修复尝试
+                # Repair
                 self._repair_inplace(c1, D, finite_mask)
                 self._repair_inplace(c2, D, finite_mask)
                 
-                offspring[o] = c1; o += 1
-                if o < off_count:
-                    offspring[o] = c2; o += 1
-
-            # --- B. 评估阶段 (Evaluation) ---
-            batch_lengths_jit(offspring, D, offspring_f)
-
-            # --- C. 选择阶段 (Selection: Lambda + Mu) ---
-            # 合并父代与子代适应度
-            union_fit[:self.lam] = fitness
-            union_fit[self.lam:] = offspring_f
+                c_pop[i] = c1
+                c_pop[i+1] = c2
             
-            # 策略：优先保留可行解，再按距离排序
-            is_feasible = np.isfinite(union_fit)
-            idx_all = np.arange(union_size)
-            idx_feas = idx_all[is_feasible]
-            idx_infe = idx_all[~is_feasible]
+            # Evaluation (Batch)
+            batch_lengths_jit(c_pop, D, c_fit)
             
-            keep = np.empty(self.lam, dtype=np.int64)
+            # --- B. RTR Replacement ---
+            # 逐个子代尝试替换
+            # 由于需要修改 population，这里串行执行最为安全
+            # 如果 bottleneck，可以将整个循环 JIT 化
             
-            if idx_feas.size >= self.lam:
-                # 可行解充足，取前 lambda 个最好的
-                # 使用 argpartition 避免全排序，提升效率
-                best_feas_indices = np.argpartition(union_fit[idx_feas], self.lam - 1)[:self.lam]
-                keep = idx_feas[best_feas_indices]
-                # 对保留的这部分再排个序（可选，为了让population有序）
-                keep = keep[np.argsort(union_fit[keep])]
-            else:
-                # 可行解不足，先全拿，剩下用不可行解填补
-                if idx_feas.size > 0:
-                     keep[:idx_feas.size] = idx_feas[np.argsort(union_fit[idx_feas])]
+            for i in range(self.lam):
+                # 调用 JIT 函数寻找窗口中最像的个体并决定是否替换
+                # 为了随机性，我们需要传入随机种子
+                seed = int(self.rng.integers(0, 1<<30))
                 
-                needed = self.lam - idx_feas.size
-                if needed > 0:
-                    # 补充不可行解
-                    fill = idx_infe[:needed] 
-                    if idx_infe.size >= needed:
-                         fill = idx_infe[:needed]
-                    else:
-                         # 极其罕见：总数不够（逻辑上不可能，因为 union_size > lam）
-                         raise ValueError("Population underflow error.")
-                    keep[idx_feas.size:] = fill
+                better, target_idx = rtr_challenge_jit(
+                    c_pop[i], c_fit[i], population, fitness, W, seed
+                )
+                
+                if better:
+                    population[target_idx][:] = c_pop[i][:]
+                    fitness[target_idx] = c_fit[i]
 
-            # 构造下一代种群
-            next_pop = np.empty_like(population)
-            next_fit = np.empty_like(fitness)
+            # --- D. Migration (Island Model) ---
+            # Pre-calc best_idx for export
+            best_idx = np.argmin(fitness)
             
-            p_i = 0
-            for idx in keep:
-                if idx < self.lam:
-                    # 来自父代
-                    cand = population[idx].copy()
-                else:
-                    # 来自子代
-                    cand = offspring[idx - self.lam].copy()
+            # 每 50 代进行一次移民交换
+            if mig_queue is not None and gen % 50 == 0:
+                # 1. Export: 发送当前最优个体
+                # 注意：发送副本，避免多进程共享内存问题
+                migrant = population[best_idx].copy()
+                try:
+                    # 非阻塞发送，如果满则丢弃
+                    mig_queue.put(migrant, block=False)
+                except:
+                    pass
                 
-                # 最终兜底：如果选入的个体仍不可行，尝试强制修复或重生
-                if not self._tour_feasible(cand, finite_mask):
-                    self._repair_inplace(cand, D, finite_mask)
-                    if not self._tour_feasible(cand, finite_mask):
-                        # 重生成一个新的可行解
-                        cand = self._greedy_feasible_tour(D, finite_mask)
+                # 2. Import: 接收移民并尝试融合
+                # 尽可能把队列读空
+                imported_count = 0
+                while recv_queue is not None:
+                    try:
+                        guest = recv_queue.get(block=False)
+                        # 使用 RTR 逻辑尝试插入移民
+                        # 移民也需要挑战一个窗口内最像它的本地人
+                        g_fit = tour_length_jit(guest, D)
+                        
+                        seed = int(self.rng.integers(0, 1<<30))
+                        better, target_idx = rtr_challenge_jit(
+                            guest, g_fit, population, fitness, W, seed
+                        )
+                        
+                        if better:
+                            population[target_idx][:] = guest[:]
+                            fitness[target_idx] = g_fit
+                            imported_count += 1
+                    except:
+                        # 队列空
+                        break
                 
-                next_pop[p_i] = cand
-                next_fit[p_i] = tour_length_jit(cand, D) # 重新计算确保准确
-                p_i += 1
-                
-            population, fitness = next_pop, next_fit
+                if imported_count > 0:
+                     print(f"[Island {island_id}] Imported {imported_count} migrants.")
 
-            # --- D. 上报与统计 (Reporting) ---
+            # --- E. Reporting & Metrics ---
+            # best_idx 已经在上面更新过
             best_idx = np.argmin(fitness)
             bestObjective = float(fitness[best_idx])
-            bestSolution = self._rotate_to_start(population[best_idx].copy(), 0)
             meanObjective = float(fitness.mean())
-
-            # 打印日志
-            print(f"{gen},{bestObjective:.6f}", flush=True)
-
-            # 调用 Reporter
-            timeLeft = self.reporter.report(meanObjective, bestObjective, bestSolution)
+            bestSolution = self._rotate_to_start(population[best_idx].copy(), 0)
             
-            # --- E. 停滞检测与灾变 (Stagnation & Cataclysm) ---
+            # 记录 best_ever
             if bestObjective < self.best_ever_fitness:
                 self.best_ever_fitness = bestObjective
                 self.stagnation_counter = 0
-                print(f"    -> [Gen {gen}] !! NEW BEST: {bestObjective:.6f} !!")
+                
+                # New Best! Print immediately
+                div_dist, div_ent = calc_diversity_metrics_jit(population, population[best_idx])
+                print(f"Gen {gen:4d} | Best: {bestObjective:.2f} | Div: {div_dist:.1f} | Ent: {div_ent:.3f} (NEW BEST)")
+                
             else:
                 self.stagnation_counter += 1
                 
+                # 定期日志 (每 50 代)
+                if gen % 50 == 0:
+                    div_dist, div_ent = calc_diversity_metrics_jit(population, population[best_idx])
+                    print(f"Gen {gen:4d} | Best: {bestObjective:.2f} | Div: {div_dist:.1f} | Ent: {div_ent:.3f}")
+            
+            # --- Call Reporter (Time Check & CSV Log) ---
+            # 必须每代调用，以检查时间并记录 CSV
+            timeLeft = self.reporter.report(meanObjective, bestObjective, bestSolution)
+            if timeLeft < 0:
+                print(f"[Island {island_id}] Time limit reached. Stopping.")
+                break
+
+            # --- Stagnation & Restart ---
             if self.stagnation_counter >= self.stagnation_limit:
-                print(f"    -> [Gen {gen}] !! STAGNATION ({self.stagnation_counter} gens) !!")
-                print(f"    -> !! RESTARTING POPULATION (Cataclysm) !!")
+                print(f"!! STAGNATION ({self.stagnation_counter} gens) -> RESTART !!")
                 
-                # 1. 保存当前历史最优
                 best_tour_ever = population[best_idx].copy()
                 
-                # 2. 重新初始化种群
                 seeds = np.random.randint(0, 1<<30, self.lam).astype(np.int64)
                 rcl_r = int(self.rng.integers(3, 11))
                 init_population_jit(population, D, finite_mask, knn_idx, strat_probs, seeds, rcl_r)
                 
-                # 3. 注入历史最优
                 population[0] = best_tour_ever
-                
-                # 4. 重新评估
                 batch_lengths_jit(population, D, fitness)
                 
-                # 5. 重置状态
                 self.stagnation_counter = 0
-                self.best_ever_fitness = fitness.min() # 确保一致
+                self.best_ever_fitness = fitness.min()
                 
-                print(f"    -> [Gen {gen}] !! RESTART COMPLETE !!")
+                # 重启后强制打印一次
+                print(f"-- Restart Complete. Best kept: {self.best_ever_fitness:.2f} --")
 
-            if timeLeft < 0:
-                print("Time limit reached.")
-                break
+            # Time check done above
 
+        
+        # ==================== Final Polish (High Intensity) ====================
+        print(f"[Island {island_id}] Final Polish: Running heavy local search on best solution...")
+        best_idx = np.argmin(fitness)
+        best_tour = population[best_idx].copy()
+        
+        # 运行长时间的混合局部搜索 (5000 步)
+        # 注意：这里我们可以直接调用 _light_two_opt_inplace，虽然名字带 "light"，但步数设大就是 "heavy"
+        self._light_two_opt_inplace(best_tour, D, finite_mask, max_steps=5000)
+        
+        final_fit = tour_length_jit(best_tour, D)
+        if final_fit < self.best_ever_fitness:
+             print(f"[Island {island_id}] Final Polish SUCCESS: {self.best_ever_fitness:.2f} -> {final_fit:.2f}")
+             self.best_ever_fitness = final_fit
+             bestSolution = self._rotate_to_start(best_tour.copy(), 0)
+             # One last report
+             self.reporter.report(final_fit, final_fit, bestSolution)
+        else:
+             print(f"[Island {island_id}] Final Polish found no improvement.")
+              
         return 0
 
     # -------- 辅助方法 (Helpers) --------
@@ -709,12 +946,22 @@ class r0123456:
                     tour[j] = city
 
     def _light_two_opt_inplace(self, tour: np.ndarray, D: np.ndarray, finite_mask: np.ndarray, max_steps: int):
-        """调用 JIT 版局部搜索"""
+        """调用 JIT 版局部搜索 (混合 2-opt 和 Or-opt)"""
         steps = int(max_steps)
         for _ in range(steps):
-             # 若没有改进则提前退出
-            if not _two_opt_once_jit_safe(tour, D):
-                break
+             # 80% 概率做 2-opt, 20% 概率做 Or-opt
+            if self.rng.random() < 0.8:
+                if not _two_opt_once_jit_safe(tour, D):
+                     # 如果 2-opt 失败，尝试 Or-opt 救一下
+                    if not _or_opt_once_jit(tour, D, 3): # 尝试移动长度为 3 的块
+                         break
+            else:
+                 # 随机选择块大小 1, 2, 3
+                bs = int(self.rng.integers(1, 4))
+                if not _or_opt_once_jit(tour, D, bs):
+                    # 如果 Or-opt 失败，尝试 2-opt
+                     if not _two_opt_once_jit_safe(tour, D):
+                        break
 
     def _repair_inplace(self, tour: np.ndarray, D: np.ndarray, finite_mask: np.ndarray):
         """调用 JIT 版修复逻辑"""
@@ -757,11 +1004,11 @@ if __name__ == "__main__":
         "N_RUNS": 10_000_000,    # 最大迭代代数
         "lam": 2000,           # 种群规模 (Lambda)
         "mu": 1500,             # 子代规模 (Mu)
-        "k_tournament": 30,     # 锦标赛选择 K 值
-        "mutation_rate": 0.3,   # 变异概率
+        "k_tournament": 3,     # 锦标赛选择 K 值
+        "mutation_rate": 0.5,   # 变异概率
         "local_rate": 0.2,      # 局部搜索概率
         "ls_max_steps": 30,     # 局部搜索最大步数
-        "stagnation_limit": 8   # 停滞多少代触发重启
+        "stagnation_limit": 200   # 停滞多少代触发重启 (RTR 需要耐心)
     }
     
     print("Running with config:", config)

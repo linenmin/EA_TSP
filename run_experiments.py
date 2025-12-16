@@ -37,8 +37,8 @@ experiments = [
         "filename": "tour500.csv",
         "params": {
             "N_RUNS": 10_000_000,
-            "lam": 20000,
-            "mu": 15000,
+            "lam": 2000,
+            "mu": 1500,
             "mutation_rate": 0.3,
             "k_tournament": 30,
             "local_rate": 0.2,
