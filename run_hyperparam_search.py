@@ -28,11 +28,11 @@ from optimized_thread_LocalSearch_inf import r0123456
 
 # 用户指定需要搜索的文件列表
 TARGET_FILES = [
-    # "tour50.csv", 
-    # "tour250.csv",
-    # "tour500.csv",
-    # "tour750.csv",
-    "tour1000.csv"
+    "tour500.csv",
+    "tour750.csv",
+    "tour1000.csv",
+    "tour50.csv", 
+    "tour250.csv"
 ]
 
 LOG_FILE = "hpc_grid_search_results.csv"

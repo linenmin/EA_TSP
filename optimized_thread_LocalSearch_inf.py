@@ -15,7 +15,9 @@ os.environ.setdefault("OMP_NUM_THREADS", "1")
 
 # -------- Numba JIT 配置 (Numba Configuration) --------
 try:
-    from numba import njit, prange, set_num_threads
+    from numba import njit, prange, set_num_threads, get_num_threads
+    from numba.np.ufunc.parallel import _get_thread_id
+    import numba.config
     # 强制要求 Numba 环境，否则报错并退出
     print("Numba imported successfully. JIT compilation enabled.")
 except ImportError:
@@ -23,7 +25,13 @@ except ImportError:
     exit(1)
 
 # 设置 Numba 并行线程数（根据硬件调整，通常2-4个足够）
-set_num_threads(4)
+# ⭐ 智能检测：如果环境变量已限制线程数，则遵循该限制
+_numba_threads_env = os.environ.get("NUMBA_NUM_THREADS", None)
+if _numba_threads_env is not None:
+    _max_threads = int(_numba_threads_env)
+else:
+    _max_threads = 4  # 默认使用 4 个线程
+set_num_threads(_max_threads)
 
 
 # ==============================================================================
