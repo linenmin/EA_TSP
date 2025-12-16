@@ -33,6 +33,10 @@ NUM_TRIALS_PER_FILE = 36
 
 # 不同文件大小对应不同的搜索范围
 # 定则：小图搜大种群，大图搜小种群 (Memetic)
+
+# ... (PARAM_GRIDS_BY_FILE definition)
+# 不同文件大小对应不同的搜索范围
+# 定则：小图搜大种群，大图搜小种群 (Memetic)
 PARAM_GRIDS_BY_FILE = {
     # Tiny & Small (50-250): brute force diversity
     "tour50.csv": {
@@ -49,20 +53,22 @@ PARAM_GRIDS_BY_FILE = {
     },
     # Medium (500): Transition zone
     "tour500.csv": {
-        "lam": [500, 800, 1000, 1500],
+        # 修正：包含更小的种群 (150-500) 以支持 Memetic 搜索
+        "lam": [150, 300, 500, 800],
         "exploit_mut": [0.2, 0.3], "explore_mut": [0.7, 0.9],
         "exploit_ls_step": [30, 40, 50], "explore_ls_step": [15, 25],
-        "exploit_ls_rate": [0.5, 0.8], "explore_ls_rate": [0.2, 0.4]
+        "exploit_ls_rate": [0.5, 0.8, 1.0], "explore_ls_rate": [0.2, 0.4, 0.6]
     },
     # Large (750-1000): Memetic (High Quality, Low Quantity)
     "tour750.csv": {
-        "lam": [100, 150, 200, 300],
+        "lam": [100, 120, 150, 200],
         "exploit_mut": [0.2, 0.3, 0.4], "explore_mut": [0.7, 0.8, 0.9],
         "exploit_ls_step": [40, 50, 60], "explore_ls_step": [15, 20, 30],
         "exploit_ls_rate": [0.8, 1.0], "explore_ls_rate": [0.4, 0.6]
     },
     "tour1000.csv": {
-        "lam": [50, 80, 100, 150], # Very lean for 1000
+         # 1000城非常吃力，尝试极简种群
+        "lam": [50, 80, 100, 150],
         "exploit_mut": [0.2, 0.3, 0.4], "explore_mut": [0.7, 0.8, 0.9],
         "exploit_ls_step": [40, 50, 60], "explore_ls_step": [15, 20, 30],
         "exploit_ls_rate": [0.8, 1.0], "explore_ls_rate": [0.4, 0.6]
@@ -73,7 +79,7 @@ PARAM_GRIDS_BY_FILE = {
 DEFAULT_GRID = PARAM_GRIDS_BY_FILE["tour1000.csv"]
 
 def worker_island_wrapper(island_id, config, csv_file, mig_queue, recv_queue, result_queue):
-    """Wrapper to run island and catch result."""
+    # Wrapper code ... (unchanged)
     seed = random.randint(0, 1_000_000)
     solver = r0123456(
         N_RUNS=10_000_000,
@@ -99,7 +105,6 @@ def worker_island_wrapper(island_id, config, csv_file, mig_queue, recv_queue, re
     result_queue.put((island_id, best_fit))
 
 
-
 # ... (imports)
 
 def generate_random_configs(grid, n=100):
@@ -114,38 +119,16 @@ def generate_random_configs(grid, n=100):
 
 def main():
     print(f"Starting HPC Hyperparameter Search (支持断点续传)")
-    print(f"Targets: {TARGET_FILES}")
-    
-    # --- 1. 初始化日志与断点恢复 ---
-    
-    # 默认表头键值 (基于tour1000的网格，假设所有网格键一致)
-    keys = list(DEFAULT_GRID.keys())
-    # CSV 表头: 文件名, 任务ID, 最优解, 耗时, ...参数...
-    headers = ["filename", "run_id", "best_fitness", "duration"] + keys
-    
-    # 统计已完成的任务数量
-    completed_counts = {fname: 0 for fname in TARGET_FILES}
-    
-    if os.path.exists(LOG_FILE):
-        print(f"Found existing log: {LOG_FILE}, analyzing progress...")
-        try:
-            df = pd.read_csv(LOG_FILE)
-            # 统计每个文件跑了多少行
-            counts = df['filename'].value_counts()
-            for fname in TARGET_FILES:
-                if fname in counts:
-                    completed_counts[fname] = counts[fname]
-                    print(f"  - {fname}: 已完成 {completed_counts[fname]} / {NUM_TRIALS_PER_FILE}")
-        except Exception as e:
-            print(f"Error reading log file: {e}. Starting fresh.")
-    else:
-        # 如果文件不存在，创建并写入表头
-        print("Creating new log file...")
-        with open(LOG_FILE, 'w', newline='') as f:
-            writer = csv.writer(f)
+    # ... (header setup logic unchanged)
+    # ...
             writer.writerow(headers)
             
-    MAX_PAIRS = 18  # 最大并发数 (36核 / 2)
+    # MAX_PAIRS: 并行度控制
+    # 原来是 18 (36核满载)，但这会导致内存带宽争抢，降低每核的有效算力
+    # 导致 300秒内跑不了几代。降低到 14 (28核) 以留有余地。
+    MAX_PAIRS = 14  
+    
+    # ... (rest of main loop)
     
     # --- 2. 遍历每个文件进行搜索 ---
     for filename in TARGET_FILES:

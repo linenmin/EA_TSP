@@ -29,7 +29,7 @@ PROBLEM_CONFIGS = {
         "N_RUNS": 10_000_000, "lam": 1000, "mu": 1000, "stagnation_limit": 300
     },
     "tour500.csv": {
-        "N_RUNS": 10_000_000, "lam": 300, "mu": 300, "stagnation_limit": 200
+        "N_RUNS": 10_000_000, "lam": 500, "mu": 500, "stagnation_limit": 200
     },
     "tour750.csv": {
         "N_RUNS": 10_000_000, "lam": 150, "mu": 150, "stagnation_limit": 150
@@ -100,7 +100,7 @@ def island_worker(island_id, config, csv_file, mig_queue, recv_queue):
 
 def main():
     # --- 用户在此处选择目标文件 ---
-    TARGET_CSV = "tour1000.csv"
+    TARGET_CSV = "tour500.csv"
     # TARGET_CSV = "tour500.csv"
     
     print("==================================================")
