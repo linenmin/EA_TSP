@@ -100,7 +100,7 @@ def island_worker(island_id, config, csv_file, mig_queue, recv_queue):
 
 def main():
     # --- 用户在此处选择目标文件 ---
-    TARGET_CSV = "tour500.csv"
+    TARGET_CSV = "tour1000.csv"
     # TARGET_CSV = "tour500.csv"
     
     print("==================================================")
