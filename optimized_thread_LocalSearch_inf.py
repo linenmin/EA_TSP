@@ -116,6 +116,40 @@ def _erx_jit(p1, p2):
 
 
 @njit(cache=True, fastmath=True)
+def _ox_jit(p1, p2):
+    """
+    P2: Order Crossover (OX) - 保留父代的连续子路径结构。
+    比 ERX 更简单，与 Or-Opt 配合更好。
+    """
+    n = p1.size
+    child = np.full(n, -1, np.int32)
+    
+    # 随机选择切点 [cut1, cut2)
+    cut1 = np.random.randint(0, n - 1)
+    cut2 = np.random.randint(cut1 + 1, n)
+    
+    # 复制 p1[cut1:cut2] 到 child
+    for i in range(cut1, cut2):
+        child[i] = p1[i]
+    
+    # 构建已使用城市集合
+    used = np.zeros(n, np.uint8)
+    for i in range(cut1, cut2):
+        used[p1[i]] = 1
+    
+    # 从 cut2 开始，按 p2 顺序填充剩余城市
+    idx = cut2
+    for i in range(n):
+        city = p2[(cut2 + i) % n]
+        if used[city] == 0:
+            child[idx % n] = city
+            idx += 1
+            used[city] = 1
+    
+    return child
+
+
+@njit(cache=True, fastmath=True)
 def tour_length_jit(tour, D):
     """
     计算单条路径的总长度。
@@ -899,9 +933,9 @@ class r0123456:
                 idx1 = self._k_tournament_idx(fitness, self.k_tournament)
                 idx2 = self._k_tournament_idx(fitness, self.k_tournament)
                 
-                # Crossover
-                c1 = self._erx(population[idx1], population[idx2])
-                c2 = self._erx(population[idx2], population[idx1])
+                # P2: 使用 OX 交叉 (保留连续子路径结构)
+                c1 = _ox_jit(population[idx1], population[idx2])
+                c2 = _ox_jit(population[idx2], population[idx1])
                 
                 # Mutation
                 if self.rng.random() < self.mutation_rate:
