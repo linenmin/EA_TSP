@@ -1023,11 +1023,22 @@ class r0123456:
                     pass
                 
                 # 2. Import: 接收移民并尝试融合
-                # 尽可能把队列读空
-                imported_count = 0
-                while recv_queue is not None:
-                    try:
-                        guest = recv_queue.get(block=False)
+                # 注：Explorer (island_id=1) 完全不接收移民，保持纯粹探索
+                # 这实现了"注射式岛屿"模式：Explorer 只发送，从不接收
+                if island_id == 1:
+                    # Explorer: 清空接收队列但不处理（避免队列阻塞）
+                    while recv_queue is not None:
+                        try:
+                            recv_queue.get(block=False)  # 丢弃
+                        except:
+                            break
+                    imported_count = 0
+                else:
+                    # Exploiter: 正常接收移民
+                    imported_count = 0
+                    while recv_queue is not None:
+                        try:
+                            guest = recv_queue.get(block=False)
                         
                         # === Island Repulsion (互斥机制) ===
                         # 仅 Explorer (Island 1) 负责避让 Exploiter (Island 0)
@@ -1099,13 +1110,29 @@ class r0123456:
                 div_dist, div_ent = calc_diversity_metrics_jit(population, population[best_idx])
                 print(f"Gen {gen:4d} | Best: {bestObjective:.2f} | Div: {div_dist:.1f} | Ent: {div_ent:.3f} (NEW BEST)")
                 
-                # --- Explorer 立即推送机制 ---
-                # 当 Explorer 发现改进时，立即推送给 Exploiter，不等 50 代迁移周期
+                # --- Explorer 注射式岛屿模式 ---
+                # 当 Explorer 发现改进时：
+                # 1. 立即推送给 Exploiter
+                # 2. 自动重启种群，继续探索新区域
                 if island_id == 1 and mig_queue is not None:
                     migrant = population[best_idx].copy()
                     try:
                         mig_queue.put(migrant, block=False)
-                        print(f"[Island {island_id}] Immediate push: found improvement, sending to Exploiter")
+                        print(f"[Island {island_id}] INJECTION: Found improvement {bestObjective:.2f}, pushing to Exploiter & restarting...")
+                        
+                        # === 自动重启种群 (神风特攻队模式) ===
+                        # 发送后立即重启，继续探索新区域
+                        seeds = np.empty(self.lam, dtype=np.int64)
+                        for k in range(self.lam): seeds[k] = int(self.rng.integers(1<<30))
+                        strat_probs = np.array([0.1, 0.8, 0.1], dtype=np.float64)
+                        rcl_r = int(self.rng.integers(5, 15))
+                        
+                        init_population_jit(population, D, finite_mask, knn_idx, strat_probs, seeds, rcl_r)
+                        batch_lengths_jit(population, D, fitness)
+                        
+                        # 重置停滞计数
+                        self.stagnation_counter = 0
+                        
                     except:
                         pass  # 队列满则丢弃
                 
