@@ -973,18 +973,26 @@ class r0123456:
             batch_lengths_jit(c_pop, D, c_fit)
             
             # --- P3: Elite-Only Local Search (精英优先 LS) ---
-            # 只对适应度前 20% 的子代进行局部搜索，其余保留结构差异
-            # 注：Explorer (island_id=1) 完全跳过 LS，纯探索模式
-            if island_id == 0:  # 只有 Exploiter 做 LS
+            # Exploiter: 强力 LS (20% 精英, 完整步数)
+            # Explorer: 轻量 LS (10% 精英, 5 步) - 提升解质量但保持探索速度
+            if island_id == 0:  # Exploiter: 强力 LS
                 elite_ratio = 0.2
                 elite_count = max(1, int(self.lam * elite_ratio))
-                elite_indices = np.argsort(c_fit)[:elite_count]  # 选最好的 20%
+                elite_indices = np.argsort(c_fit)[:elite_count]
                 
                 for idx in elite_indices:
-                    # P1: 使用候选列表驱动的 Or-Opt，比随机采样快且不漏改进
                     _candidate_or_opt_jit(c_pop[idx], D, knn_idx, max_iters=self.ls_max_steps)
                 
-                # 重新评估被 LS 优化过的个体
+                for idx in elite_indices:
+                    c_fit[idx] = tour_length_jit(c_pop[idx], D)
+            else:  # Explorer: 轻量 LS (仅 5 步，提升竞争力以增加注射机会)
+                elite_ratio = 0.1  # 只对 10% 精英做 LS
+                elite_count = max(1, int(self.lam * elite_ratio))
+                elite_indices = np.argsort(c_fit)[:elite_count]
+                
+                for idx in elite_indices:
+                    _candidate_or_opt_jit(c_pop[idx], D, knn_idx, max_iters=5)  # 仅 5 步
+                
                 for idx in elite_indices:
                     c_fit[idx] = tour_length_jit(c_pop[idx], D)
             
