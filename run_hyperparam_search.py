@@ -5,6 +5,13 @@ import random
 import csv
 import pandas as pd
 import numpy as np
+
+# ⭐ 关键修复：限制 Numba 线程数，避免多进程争抢资源
+# 在 import 优化模块之前设置，每个进程只用 1 个 Numba 线程
+os.environ["NUMBA_NUM_THREADS"] = "1"
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+
 from optimized_thread_LocalSearch_inf import r0123456
 
 # ==============================================================================
@@ -79,8 +86,19 @@ PARAM_GRIDS_BY_FILE = {
 DEFAULT_GRID = PARAM_GRIDS_BY_FILE["tour1000.csv"]
 
 def worker_island_wrapper(island_id, config, csv_file, mig_queue, recv_queue, result_queue):
-    # Wrapper code ... (unchanged)
+    """
+    岛屿进程工作函数。
+    ⭐ 关键修复：stagnation_limit 根据岛屿角色动态调整
+    """
     seed = random.randint(0, 1_000_000)
+    
+    # ⭐ 动态设置 stagnation_limit（与 run_island_model.py 保持一致）
+    base_stag = 150
+    if island_id == 0:  # Exploiter: 更快重启
+        stag_limit = int(base_stag * 0.8)  # 120
+    else:  # Explorer: 允许更长时间探索
+        stag_limit = int(base_stag * 1.5)  # 225
+    
     solver = r0123456(
         N_RUNS=10_000_000,
         lam=int(config["lam"]),
@@ -89,13 +107,12 @@ def worker_island_wrapper(island_id, config, csv_file, mig_queue, recv_queue, re
         mutation_rate=config["mutation_rate"],
         local_rate=config["local_rate"],
         ls_max_steps=config["ls_max_steps"],
-        stagnation_limit=200,
+        stagnation_limit=stag_limit,  # ⭐ 使用动态值
         rng_seed=seed
     )
     
     try:
         # Time limit is handled internally by Reporter/Optimize loop (300s)
-        # We assume Optimize respects the 300s limit.
         solver.optimize(csv_file, mig_queue=mig_queue, recv_queue=recv_queue, island_id=island_id)
         best_fit = solver.best_ever_fitness
     except Exception as e:
@@ -186,15 +203,22 @@ def main():
                 print(f"[{filename}] Launching Run {run_id}/{NUM_TRIALS_PER_FILE}...")
                 
                 # 构建两个岛屿的配置
+                # ⭐ 关键修复：local_rate 固定为与 run_island_model.py 一致的值
+                # Exploiter: local_rate=1.0 (全民皆兵，每个子代必做局部搜索)
+                # Explorer: local_rate=0.6 (保持探索性，但也要优化)
                 cfg0 = {
                     "lam": params["lam"],
-                    "k_tournament": 5, "mutation_rate": params["exploit_mut"],
-                    "local_rate": params["exploit_ls_rate"], "ls_max_steps": params["exploit_ls_step"]
+                    "k_tournament": 5, 
+                    "mutation_rate": params["exploit_mut"],
+                    "local_rate": 1.0,  # ⭐ 固定为 1.0，这是 Memetic 的核心！
+                    "ls_max_steps": params["exploit_ls_step"]
                 }
                 cfg1 = {
                     "lam": params["lam"],
-                    "k_tournament": 2, "mutation_rate": params["explore_mut"],
-                    "local_rate": params["explore_ls_rate"], "ls_max_steps": params["explore_ls_step"]
+                    "k_tournament": 2, 
+                    "mutation_rate": params["explore_mut"],
+                    "local_rate": 0.6,  # ⭐ 固定为 0.6，与单跑一致
+                    "ls_max_steps": params["explore_ls_step"]
                 }
                 
                 # 创建通信队列
