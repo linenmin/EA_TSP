@@ -707,12 +707,13 @@ def calc_diversity_metrics_jit(pop, best_tour):
 @njit(cache=True, fastmath=True)
 def rtr_challenge_jit(child, child_fit, pop, fit, W, rng_seed):
     """
-    RTR (Restricted Tournament Replacement) 单个挑战逻辑
-    child: 子代
-    pop: 当前种群
-    W: 窗口大小
+    RTR (Restricted Tournament Replacement) 带多样性豁免机制
+    
+    新增逻辑: 如果 child 与 target 距离足够远 (独特性高)，
+    即使 fitness 稍差也允许替换，以保护多样性。
     """
     m = pop.shape[0]
+    n = child.shape[0]  # 城市数量
     np.random.seed(rng_seed)
     
     # 1. 随机选择 W 个窗口个体
@@ -728,14 +729,25 @@ def rtr_challenge_jit(child, child_fit, pop, fit, W, rng_seed):
             min_dist = dist
             closest_idx = idx
             
-    # 3. 竞争：如果 child 更强 (距离越短 fit 越小)，则替换
-    # 注意：我们这里只返回是否替换和替换位置，实际替换在外部做
+    # 3. 竞争 (带多样性豁免)
     target_idx = closest_idx
     target_fit = fit[target_idx]
     
     better = False
+    
+    # 逻辑 A: 硬实力更强 (直接胜出)
     if child_fit < target_fit:
         better = True
+    
+    # 逻辑 B: 多样性豁免 (Diversity Exemption)
+    # 如果距离超过 15% (n * 0.15)，且 fitness 差距在 2% 以内，允许替换
+    # 这让 Explorer 的异构解能存活下来
+    else:
+        threshold_dist = n * 0.15  # 750 城市时，要求至少 112 条边不同
+        relax_factor = 1.02        # 允许差 2%
+        
+        if min_dist > threshold_dist and child_fit < target_fit * relax_factor:
+            better = True
         
     return better, target_idx
 
@@ -1019,14 +1031,17 @@ class r0123456:
             # Pre-calc best_idx for export
             best_idx = np.argmin(fitness)
             
-            # 每 50 代进行一次移民交换
-            if mig_queue is not None and gen % 50 == 0:
+            # 发送频率: Explorer 25 代，Exploiter 50 代
+            # Explorer 更频繁发送以捕捉重启前的窗口
+            send_interval = 25 if island_id == 1 else 50
+            
+            if mig_queue is not None and gen % send_interval == 0:
                 
                 if island_id == 1:
-                    # === Explorer 新迁移策略 ===
+                    # === Explorer 分层筛选迁移 ===
                     # 1B: 分层筛选 (质量门槛30% + 距离最大)
                     # 2A: 发送 2% 种群
-                    # 3A: 定期发送 (每 50 代)
+                    # 3A: 定期发送 (每 25 代)
                     # 4A: 发送前 LS (20 步 Or-Opt)
                     # 6A: 发送后继续进化 (不重启)
                     
@@ -1161,6 +1176,32 @@ class r0123456:
             # --- Stagnation & Restart ---
             if self.stagnation_counter >= self.stagnation_limit:
                 print(f"!! STAGNATION ({self.stagnation_counter} gens) -> RESTART !!")
+                
+                # =================================================================
+                # 【FIX】: 死前遗言 (Deathbed Bequest)
+                # Explorer 在重启前发送当前种群的峰值解，防止成果丢失
+                # =================================================================
+                if island_id == 1 and mig_queue is not None:
+                    # 此时的 population 处于局部最优峰值，质量极高
+                    # 发送当前种群中最优秀的前 3 名
+                    sorted_indices = np.argsort(fitness)
+                    top_k = sorted_indices[:3]
+                    
+                    # 大幅增加打磨力度 (300 步)
+                    # 既然种群要被销毁，多花时间打磨"遗孤"很划算
+                    polish_effort = 300
+                    
+                    sent_count = 0
+                    for idx in top_k:
+                        migrant = population[idx].copy()
+                        _candidate_or_opt_jit(migrant, D, knn_idx, max_iters=polish_effort)
+                        try:
+                            mig_queue.put(migrant, block=False)
+                            sent_count += 1
+                        except:
+                            break
+                    print(f"[Island {island_id}] DEATHBED BEQUEST: Sent {sent_count} polished (steps={polish_effort}) solutions.")
+                # =================================================================
                 
                 best_tour_ever = population[best_idx].copy()
                 

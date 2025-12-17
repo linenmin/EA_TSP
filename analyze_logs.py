@@ -67,40 +67,55 @@ def plot_diversity(df0, df1, output_file='diversity.png'):
     return fig
 
 def plot_events(df0, df1, output_file='events.png'):
-    """绘制事件时间线（迁移、排斥、RTR接受率）"""
+    """绘制事件时间线 (RTR接受率 + 迁移事件)
+    
+    新设计:
+    - 子图1: RTR 接受率
+    - 子图2: Explorer 发送次数统计 (基于重启事件推断)
+    - 子图3: Exploiter 接收成功次数 (migration=1)
+    """
     fig, axes = plt.subplots(3, 1, figsize=(12, 10), sharex=True)
     
-    # RTR Accept Rate (滚动窗口)
+    # === RTR Accept Rate (滚动窗口) ===
     window = 50
     df0['rtr_rate'] = df0['rtr_accepts'].rolling(window).mean()
     df1['rtr_rate'] = df1['rtr_accepts'].rolling(window).mean()
     
-    axes[0].plot(df0['gen'], df0['rtr_rate'], label='Island 0', alpha=0.7)
-    axes[0].plot(df1['gen'], df1['rtr_rate'], label='Island 1', alpha=0.7)
+    axes[0].plot(df0['gen'], df0['rtr_rate'], label='Exploiter', alpha=0.7, color='blue')
+    axes[0].plot(df1['gen'], df1['rtr_rate'], label='Explorer', alpha=0.7, color='orange')
     axes[0].set_ylabel(f'RTR Accepts (rolling {window})')
-    axes[0].set_title('RTR Selection Pressure & Events')
+    axes[0].set_title('Selection Pressure & Migration Events')
     axes[0].legend()
     axes[0].grid(True, alpha=0.3)
     
-    # Migration Events
-    mig0 = df0[df0['migration'] == 1]
-    mig1 = df1[df1['migration'] == 1]
-    axes[1].scatter(mig0['gen'], [0.5]*len(mig0), marker='|', s=100, c='blue', label='Island 0 Import')
-    axes[1].scatter(mig1['gen'], [1.5]*len(mig1), marker='|', s=100, c='orange', label='Island 1 Import')
-    axes[1].set_ylabel('Migration Events')
-    axes[1].set_yticks([0.5, 1.5])
-    axes[1].set_yticklabels(['Island 0', 'Island 1'])
-    axes[1].legend()
+    # === Explorer 发送: 基于 stagnation 骤降检测重启 (= 死前遗言发送) ===
+    # 检测 stagnation 从高变低的时刻 (重启事件)
+    stag_diff = df1['stagnation'].diff()
+    restart_events = df1[stag_diff < -10]  # stagnation 骤降 > 10 表示重启
+    
+    axes[1].scatter(restart_events['gen'], [1]*len(restart_events), 
+                   marker='o', s=100, c='orange', edgecolors='darkorange', 
+                   linewidths=2, label=f'Explorer 死前遗言发送 ({len(restart_events)} 次)', zorder=5)
+    axes[1].axhline(y=1, color='orange', alpha=0.3, linestyle='--')
+    axes[1].set_ylabel('Explorer Sends')
+    axes[1].set_ylim(0.5, 1.5)
+    axes[1].set_yticks([1])
+    axes[1].set_yticklabels(['Deathbed Bequest'])
+    axes[1].legend(loc='upper right')
     axes[1].grid(True, alpha=0.3)
     
-    # Repulsion Events (only Island 1)
-    rep1 = df1[df1['repulsion'] == 1]
-    axes[2].scatter(rep1['gen'], [1]*len(rep1), marker='x', s=80, c='red', label='Repulsion Triggered')
-    axes[2].set_ylabel('Repulsion Events')
+    # === Exploiter 接收成功 ===
+    imports = df0[df0['migration'] == 1]
+    axes[2].scatter(imports['gen'], [1]*len(imports), 
+                   marker='o', s=100, c='blue', edgecolors='darkblue',
+                   linewidths=2, label=f'Exploiter 接收成功 ({len(imports)} 次)', zorder=5)
+    axes[2].axhline(y=1, color='blue', alpha=0.3, linestyle='--')
+    axes[2].set_ylabel('Exploiter Imports')
     axes[2].set_xlabel('Generation')
+    axes[2].set_ylim(0.5, 1.5)
     axes[2].set_yticks([1])
-    axes[2].set_yticklabels(['Island 1'])
-    axes[2].legend()
+    axes[2].set_yticklabels(['RTR Accepted'])
+    axes[2].legend(loc='upper right')
     axes[2].grid(True, alpha=0.3)
     
     plt.tight_layout()
@@ -155,7 +170,7 @@ def main():
     # 用户配置区域：只需要填入日志文件夹路径
     # ==============================================================================
     
-    LOG_FOLDER = "logs_20251217_115250"  # 填入日志文件夹名称
+    LOG_FOLDER = "logs_20251217_122354"  # 填入日志文件夹名称
     
     # ==============================================================================
     

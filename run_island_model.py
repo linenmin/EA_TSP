@@ -259,12 +259,13 @@ def main():
             name=f"{target_csv}_Explorer"
         )
         
+        # 设置为 daemon 进程，主进程退出时自动终止
+        p1.daemon = True
+        p2.daemon = True
+        
         all_processes.extend([p1, p2])
     
     print(f"\n启动 {len(all_processes)} 个进程...")
-    
-    # 收集所有队列用于清理
-    all_queues = []
     
     try:
         # 启动所有进程
