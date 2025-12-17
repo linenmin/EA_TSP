@@ -90,13 +90,15 @@ def apply_role(base_config, role):
         
     else:  # Scout (快速侦察兵)
         cfg["k_tournament"] = 2
-        # Scout 使用固定小种群 (e.g. 100) 以便快速迭代
-        cfg["lam"] = 100
-        cfg["mu"] = 100
+        # Scout 使用固定小种群 (e.g. 150) 以便快速迭代，但比 100 稍大以增加多样性
+        cfg["lam"] = 150
+        cfg["mu"] = 150
         cfg["mutation_rate"] = 0.5 # Moderate mutation
         cfg["local_rate"] = 1.0    # 必须强 LS 才能产出高质量解
         cfg["ls_max_steps"] = 50   # Deep Search
-        cfg["stagnation_limit"] = 50 # 频繁重启 (每 50 代无进展即重置)
+        # 动态停滞阈值: 至少 100 代，或者是 Base Config 的 40% (针对小种群优化)
+        # 这确保了在 tour500/750/1000 等大图上有足够的收敛时间，而不是"幼儿期夭折"
+        cfg["stagnation_limit"] = max(100, int(base_config["stagnation_limit"] * 0.4))
         
     return cfg
 

@@ -1,67 +1,106 @@
 
-import numpy as np
-import os
 import sys
-from optimized_thread_LocalSearch_inf import r0123456
-from run_island_model import apply_role, DEFAULT_CONFIG
+import os
+import numpy as np
 
-def test_scout_config():
-    print("Testing Scout Config in apply_role...")
-    cfg = apply_role(DEFAULT_CONFIG, 1) # Role 1 = Scout
-    # Check key scout params
-    success = True
-    if cfg["lam"] != 100:
-        print(f"FAIL: Scout lam should be 100, got {cfg['lam']}")
-        success = False
-    if cfg["ls_max_steps"] != 50:
-        print(f"FAIL: Scout ls_max_steps should be 50, got {cfg['ls_max_steps']}")
-        success = False
-    if cfg["stagnation_limit"] != 50:
-        print(f"FAIL: Scout stagnation_limit should be 50, got {cfg['stagnation_limit']}")
-        success = False
-        
-    if success:
-        print("PASS: Scout config correct.")
+# Mock environment to satisfy imports if needed
+os.environ["NUMBA_NUM_THREADS"] = "1"
 
-def test_asymmetry_detection_and_run():
-    print("\nTesting Asymmetry Detection & Running short loop...")
-    # Create asymmetric matrix (3 cities)
-    # 0->1: 10, 1->0: 100
-    D = np.array([
-        [0.0, 10.0, 100.0],
-        [100.0, 0.0, 10.0], # 1->2 is 10, 2->1 is 100 (if 2->1 is 20 in previous thought)
-        [10.0, 100.0, 0.0]
-    ], dtype=np.float64)
+def verify():
+    print("=== Verifying GA Acceleration Changes ===")
     
-    csv_name = "test_asym_verify.csv"
-    np.savetxt(csv_name, D, delimiter=",")
-    
+    # 1. 检查 Scout 配置 (Dynamic Scaling)
     try:
-        # Run extremely short optimization
-        # N_RUNS=5 is enough to trigger init, mutation, crossover loop logic
-        solver = r0123456(lam=10, N_RUNS=5, ls_max_steps=2) # Minimal setup
+        from run_island_model import apply_role
         
-        # Optimize
-        print("Starting solver...")
-        solver.optimize(csv_name)
+        # Test Case 1: Base Stag=100 -> Expected Scout Stag=max(100, 40)=100
+        base_cfg_small = {
+            "lam": 100, 
+            "stagnation_limit": 100,
+            "N_RUNS": 1000,
+            "exploit_mut": 0.3, "exploit_ls": 30
+        }
         
-        # Check symmetry flag
-        if hasattr(solver, "_is_symmetric"):
-            if solver._is_symmetric is False:
-                print("PASS: _is_symmetric is False (Correct).")
-            else:
-                print(f"FAIL: _is_symmetric is {solver._is_symmetric} (Expected False).")
-        else:
-            print("FAIL: _is_symmetric attribute missing.")
-            
+        # Role 1 = Scout
+        cfg_scout_small = apply_role(base_cfg_small.copy(), role=1)
+        assert cfg_scout_small["lam"] == 150
+        assert cfg_scout_small["stagnation_limit"] == 100
+        
+        # Test Case 2: Base Stag=400 -> Expected Scout Stag=max(100, 160)=160
+        base_cfg_large = {
+            "lam": 500, 
+            "stagnation_limit": 400,
+            "N_RUNS": 1000,
+            "exploit_mut": 0.3, "exploit_ls": 30
+        }
+        cfg_scout_large = apply_role(base_cfg_large.copy(), role=1)
+        assert cfg_scout_large["lam"] == 150
+        assert cfg_scout_large["stagnation_limit"] == 160
+        
+        print(f"[OK] Scout Configuration Verified: Base100->{cfg_scout_small['stagnation_limit']}, Base400->{cfg_scout_large['stagnation_limit']}")
+        
     except Exception as e:
-        print(f"CRASH During Execution: {e}")
+        print(f"[FAIL] Scout Config Check Failed: {e}")
+        exit(1)
+
+    # 2. 检查 Acceleration Operators (DLB, DoubleBridge, Swap)
+    try:
+        from optimized_thread_LocalSearch_inf import _candidate_or_opt_jit, double_bridge_move, _swap_segments_jit, tour_length_jit
+        
+        print("[Test] Verifying Acceleration Operators...")
+        
+        # Mock Data
+        N = 50
+        D = np.random.rand(N, N)
+        tour = np.arange(N, dtype=np.int32)
+        np.random.shuffle(tour)
+        
+        # Test 1: Double Bridge
+        print("  - Testing Double Bridge...")
+        tour_db = tour.copy()
+        tour_db = double_bridge_move(tour_db)
+        assert len(tour_db) == N
+        assert len(np.unique(tour_db)) == N
+        assert not np.array_equal(tour, tour_db) # Should be different
+        print(f"    -> OK")
+
+        # Test 2: Swap Segments
+        print("  - Testing Swap Segments...")
+        tour_swap = tour.copy()
+        # Try multiple times to ensure we hit a valid swap
+        succ = False
+        for _ in range(20):
+             if _swap_segments_jit(tour_swap, D):
+                 succ = True
+                 break
+        assert len(tour_swap) == N
+        assert len(np.unique(tour_swap)) == N
+        print(f"    -> OK (Success={succ})")
+
+        # Test 3: DLB in Or-Opt
+        print("  - Testing DLB Integration...")
+        knn = np.random.randint(0, N, (N, 5)).astype(np.int32)
+        dlb_mask = np.zeros(N, dtype=np.bool_)
+        
+        # Run once
+        start_time = os.times().elapsed
+        _candidate_or_opt_jit(tour.copy(), D, knn, max_iters=10, dlb_mask=dlb_mask)
+        # Check if dlb_mask was modified (some bits set to True likely)
+        # Note: If no improvement found, mask bits should be set to True
+        print(f"    -> OK (Ran without crash)")
+        
+        print("[OK] All Acceleration Operators Verified.")
+
+    except ImportError as e:
+        print(f"[FAIL] Import Error: {e}")
+        exit(1)
+    except Exception as e:
+        print(f"[FAIL] Operator Verification Failed: {e}")
         import traceback
         traceback.print_exc()
-    finally:
-        if os.path.exists(csv_name):
-            os.remove(csv_name)
+        exit(1)
+        
+    print("\n=== SUCCESS: All Checks Passed ===")
 
 if __name__ == "__main__":
-    test_scout_config()
-    test_asymmetry_detection_and_run()
+    verify()

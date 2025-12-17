@@ -389,98 +389,242 @@ def _or_opt_once_jit(tour, D, block_size):
 
 
 @njit(cache=True, fastmath=True)
-def _candidate_or_opt_jit(tour, D, knn_idx, max_iters=100):
+def double_bridge_move(tour):
     """
-    P1: 候选列表驱动的 Or-Opt 局部搜索。
-    使用 KNN 索引，只尝试将城市移动到其最近邻附近。
-    比随机采样快 10 倍以上，且不漏掉好的改进。
+    Double Bridge (4-Opt) "Kick".
+    将路径切成 4 段 (A, B, C, D) 并重组为 (A, D, C, B)。
+    注意：这是 ATSP 安全的操作，因为它不反转任何片段的方向。
     """
-    n = tour.shape[0]        # 城市数量
-    K = knn_idx.shape[1]     # KNN 邻居数
+    n = len(tour)
+    if n < 4: return tour
     
-    # 构建位置索引: pos[city] = 该城市在 tour 中的位置
+    # 随机选 4 个切点 (需排序)
+    # 使用 np.random.choice 不支持 replace=False 在 numba 中有时会有问题，改用简单的采样
+    # 简单策略: 均匀切分加扰动
+    q = n // 4
+    p1 = 1 + np.random.randint(0, q)
+    p2 = p1 + 1 + np.random.randint(0, q)
+    p3 = p2 + 1 + np.random.randint(0, q)
+    
+    if p3 >= n: p3 = n - 1
+    
+    # 构造新路径: [0...p1] + [p3...end] + [p2...p3] + [p1...p2]
+    # 原序: A(0-p1) B(p1-p2) C(p2-p3) D(p3-end)
+    # 新序: A D C B
+    
+    # 手动拼接以兼容 Numba
+    new_tour = np.empty(n, dtype=tour.dtype)
+    idx = 0
+    
+    # A
+    for i in range(0, p1):
+        new_tour[idx] = tour[i]; idx += 1
+    # D
+    for i in range(p3, n):
+        new_tour[idx] = tour[i]; idx += 1
+    # C
+    for i in range(p2, p3):
+        new_tour[idx] = tour[i]; idx += 1
+    # B
+    for i in range(p1, p2):
+        new_tour[idx] = tour[i]; idx += 1
+        
+    return new_tour
+
+@njit(cache=True, fastmath=True)
+def _swap_segments_jit(tour, D):
+    """
+    尝试交换两个不相邻的片段 (Swap Segments)。
+    这也是 3-Opt 的一种特例，且不反转方向 (ATSP Safe)。
+    """
+    n = tour.shape[0]
+    # 随机选择两个片段 A 和 B
+    # A: [i...i+L1], B: [j...j+L2]
+    # 限制片段长度为 2-4，避免破坏太大
+    L1 = np.random.randint(2, 5)
+    L2 = np.random.randint(2, 5)
+    
+    # 随机起点
+    i = np.random.randint(0, n - L1 - L2 - 2)
+    j = np.random.randint(i + L1 + 1, n - L2)
+    
+    # 边界检查
+    if i + L1 >= j: return False # 重叠
+    
+    # 原始连接:
+    # ... -> [i-1] -> [i...i+L1-1] -> [i+L1] -> ... -> [j-1] -> [j...j+L2-1] -> [j+L2] -> ...
+    #        PreA     BlockA          PostA          PreB     BlockB          PostB
+    
+    PreA = i - 1
+    PostA = i + L1
+    PreB = j - 1
+    PostB = j + L2
+    
+    nodes = tour
+    
+    c_preA = nodes[PreA]; c_startA = nodes[i]; c_endA = nodes[i+L1-1]; c_postA = nodes[PostA]
+    c_preB = nodes[PreB]; c_startB = nodes[j]; c_endB = nodes[j+L2-1]; c_postB = nodes[PostB]
+    
+    # 移除 4 条边: (PreA, StartA), (EndA, PostA), (PreB, StartB), (EndB, PostB)
+    rm_cost = D[c_preA, c_startA] + D[c_endA, c_postA] + D[c_preB, c_startB] + D[c_endB, c_postB]
+    
+    # 增加 4 条边: (PreA, StartB), (EndB, PostA), (PreB, StartA), (EndA, PostB)
+    add_cost = D[c_preA, c_startB] + D[c_endB, c_postA] + D[c_preB, c_startA] + D[c_endA, c_postB]
+    
+    if not np.isfinite(add_cost): return False
+    
+    if add_cost < rm_cost - 1e-6:
+        # 执行交换
+        # 构造新数组比较稳妥
+        new_tour = np.empty_like(tour)
+        idx = 0
+        
+        # 0 ... PreA
+        for k in range(0, i):
+            new_tour[idx] = tour[k]; idx += 1
+            
+        # Block B
+        for k in range(j, j + L2):
+            new_tour[idx] = tour[k]; idx += 1
+            
+        # PostA ... PreB
+        for k in range(i + L1, j):
+            new_tour[idx] = tour[k]; idx += 1
+            
+        # Block A
+        for k in range(i, i + L1):
+            new_tour[idx] = tour[k]; idx += 1
+            
+        # PostB ... End
+        for k in range(j + L2, n):
+            new_tour[idx] = tour[k]; idx += 1
+            
+        tour[:] = new_tour[:]
+        return True
+        
+    return False
+
+@njit(cache=True, fastmath=True)
+def _candidate_or_opt_jit(tour, D, knn_idx, max_iters=100, dlb_mask=None):
+    """
+    P1: 候选列表驱动的 Or-Opt 局部搜索，集成 DLB 加速。
+    
+    Args:
+        dlb_mask: Boolean array for Don't Look Bits. If None, it's ignored.
+                  True means 'Don't Look' (Skip).
+    """
+    n = tour.shape[0]
+    K = knn_idx.shape[1]
+    
+    # 构建位置索引
     pos = np.empty(n, np.int32)
     for i in range(n):
         pos[tour[i]] = i
     
     improved = False
     
+    # 如果没传 DLB，就临时建一个全 False 的（全检查）
+    use_dlb = (dlb_mask is not None)
+    
     for _ in range(max_iters):
-        found = False
+        found_in_try = False
         
-        # 随机选择起点，遍历所有城市
+        # 随机遍历顺序
+        # 为了 DLB 有效，最好不要完全随机跳，而是有序遍历或随机偏移
         start = np.random.randint(0, n)
+        
         for offset in range(n):
-            u_idx = (start + offset) % n  # 当前位置
-            u = tour[u_idx]               # 当前城市
+            u_idx = (start + offset) % n
+            u = tour[u_idx]
             
-            # u 的前驱和后继
+            # DLB Check
+            if use_dlb and dlb_mask[u]:
+                continue
+                
             prev_u = tour[(u_idx - 1) % n]
             next_u = tour[(u_idx + 1) % n]
             
-            # 移除 u 的代价
             remove_cost = D[prev_u, u] + D[u, next_u]
             new_edge_cost = D[prev_u, next_u]
             
-            # 检查 new_edge 是否可行
-            if not np.isfinite(new_edge_cost):
-                continue
+            if not np.isfinite(new_edge_cost): continue
             
-            # 遍历 u 的 K 个最近邻，尝试插入到它们后面
+            move_found = False
+            
+            # 搜索 KNN
             for k in range(K):
-                target = knn_idx[u, k]  # 目标邻居
-                if target == -1:
-                    continue
-                    
-                t_idx = pos[target]     # target 在 tour 中的位置
-                next_t = tour[(t_idx + 1) % n]  # target 的后继
+                target = knn_idx[u, k]
+                if target == -1: break
                 
-                # 跳过自己和相邻位置
-                if target == u or next_t == u or target == prev_u:
-                    continue
+                # 检查 target 是否在 DLB (Strict 模式: 如果 target 也没变过，也许不用插? 
+                # 但通常只检查起点 u。这里不检查 target 的 DLB)
+
+                t_idx = pos[target]
+                next_t = tour[(t_idx + 1) % n]
                 
-                # 插入 u 到 target 后面的代价
+                if target == u or next_t == u or target == prev_u: continue
+                
                 insert_cost = D[target, u] + D[u, next_t]
                 old_edge_cost = D[target, next_t]
                 
-                # 检查边是否可行
-                if not np.isfinite(D[target, u]) or not np.isfinite(D[u, next_t]):
-                    continue
+                if not np.isfinite(insert_cost): continue
                 
-                # 计算总增量: (移除u的代价减少) + (插入u的代价增加)
-                delta = (new_edge_cost - remove_cost) + (insert_cost - old_edge_cost)
+                gain = (remove_cost - new_edge_cost) + (old_edge_cost - insert_cost)
                 
-                if delta < -1e-6:  # 找到改进
-                    # 执行移动: 从原位置删除 u，插入到 target 后面
-                    new_tour = np.empty(n, np.int32)
-                    idx = 0
+                if gain > 1e-6:
+                    # Apply Move
+                    # ... (Move Logic same as before) ...
+                    # 简化：因为 Python loop 还是慢，这里用切片逻辑如果能在 numba 里跑最好
+                    # 手动移动:
                     
-                    for i in range(n):
-                        if i == u_idx:
-                            continue  # 跳过 u
-                        new_tour[idx] = tour[i]
-                        idx += 1
-                        if tour[i] == target:
-                            # 在 target 后插入 u
-                            new_tour[idx] = u
-                            idx += 1
+                    # 0. 备份受影响的点，用于解锁 DLB
+                    affected = [prev_u, next_u, target, next_t, u]
                     
-                    tour[:] = new_tour[:]
+                    # 1. 删除 u
+                    temp_tour = np.empty(n - 1, dtype=tour.dtype)
+                    if u_idx > 0:
+                        temp_tour[:u_idx] = tour[:u_idx]
+                        temp_tour[u_idx:] = tour[u_idx+1:]
+                    else:
+                        temp_tour[:] = tour[1:]
+                        
+                    # 2. 找到 target 在 temp 中的位置
+                    # 如果 target 在 u 后面，它的索引减了 1
+                    t_idx_new = t_idx
+                    if t_idx > u_idx: t_idx_new -= 1
                     
-                    # 更新位置索引
-                    for i in range(n):
-                        pos[tour[i]] = i
+                    # 3. 在 target (t_idx_new) 后面插入 u
+                    # new tour len = n
+                    # [0 ... t_idx_new] + [u] + [t_idx_new+1 ... end]
                     
-                    found = True
+                    tour[:t_idx_new+1] = temp_tour[:t_idx_new+1]
+                    tour[t_idx_new+1] = u
+                    tour[t_idx_new+2:] = temp_tour[t_idx_new+1:]
+                    
+                    # Rebuild pos (Slow? incremental update is better but complex)
+                    for i in range(n): pos[tour[i]] = i
+                    
+                    move_found = True
                     improved = True
-                    break  # 找到改进就退出内层循环
+                    
+                    # Unlock DLB for affected cities
+                    if use_dlb:
+                        for ac in affected:
+                            dlb_mask[ac] = False
+                            
+                    break # Break KNN loop
             
-            if found:
-                break  # 找到改进就退出外层循环
-        
-        if not found:
-            break  # 没找到改进，停止迭代
-    
+            if move_found:
+                found_in_try = True
+            else:
+                # 只有当彻底搜索了所有邻居都没找到移动，才 Lock u
+                if use_dlb:
+                    dlb_mask[u] = True
+                    
+        if not found_in_try and use_dlb:
+            # 如果一整圈都没动静，说明陷入极值，直接退出
+            break
+            
     return improved
 
 
@@ -904,6 +1048,9 @@ class r0123456:
         knn_idx = build_knn_idx(D, finite_mask, K)
         self._knn_idx = knn_idx  # 保存引用
         print(f"[Island {island_id}] [Init] KNN ready.")
+        
+        # --- DLB Mask Initialization ---
+        dlb_mask = np.zeros(n, dtype=np.bool_)
 
         # 5. 生成初始种群 (并行)
         strat_probs = np.array([0.1, 0.3, 0.6], dtype=np.float64) # RCL / Insert / Rand
@@ -999,7 +1146,10 @@ class r0123456:
             elite_indices = np.argsort(c_fit)[:elite_count]
             
             for idx in elite_indices:
-                _candidate_or_opt_jit(c_pop[idx], D, knn_idx, max_iters=self.ls_max_steps)
+                # 必须为每个个体分别重置 DLB mask，否则上一个体的 bits 会污染下一个
+                dlb_mask[:] = False
+                # 使用 DLB 加速 Or-Opt
+                _candidate_or_opt_jit(c_pop[idx], D, knn_idx, max_iters=self.ls_max_steps, dlb_mask=dlb_mask)
             
             for idx in elite_indices:
                 c_fit[idx] = tour_length_jit(c_pop[idx], D)
@@ -1026,6 +1176,23 @@ class r0123456:
                     fitness[target_idx] = c_fit[i]
                     _rtr_accepts += 1  # 诊断日志：记录 RTR 接受数
 
+            # --- C. Kick Strategy (Double Bridge) ---
+            # 如果即将陷入停滞 (Stagnation > 50% Limit)，尝试对最差个体注入"踢过的精英"，试图打破僵局
+            if self.stagnation_counter > self.stagnation_limit * 0.5:
+                 if gen % 10 == 0: 
+                     current_best = np.argmin(fitness)
+                     kick_cand = population[current_best].copy()
+                     kick_cand = double_bridge_move(kick_cand)
+                     # 踢完简单修复
+                     dlb_mask[:] = False
+                     _candidate_or_opt_jit(kick_cand, D, knn_idx, max_iters=50, dlb_mask=dlb_mask)
+                     k_fit = tour_length_jit(kick_cand, D)
+                     
+                     # 替换当前最差
+                     worst_idx = np.argmax(fitness)
+                     population[worst_idx][:] = kick_cand[:]
+                     fitness[worst_idx] = k_fit
+
             # --- D. Migration (Scout Model) ---
             # Pre-calc best_idx for export
             best_idx = np.argmin(fitness)
@@ -1044,8 +1211,9 @@ class r0123456:
                     if island_id == 1: # Scout 发送
                          # 发送 Best
                         migrant = population[best_idx].copy()
-                         # 额外打磨一下
-                        _candidate_or_opt_jit(migrant, D, knn_idx, max_iters=500)
+                         # 额外打磨一下 (Use DLB)
+                        dlb_mask[:] = False
+                        _candidate_or_opt_jit(migrant, D, knn_idx, max_iters=500, dlb_mask=dlb_mask)
                         try:
                             mig_queue.put(migrant, block=False)
                             print(f"[Scout] Sent BEST to Exploiter.")
@@ -1141,8 +1309,9 @@ class r0123456:
                 # Scout (Island 1) 在重启前发送 Best 给 Exploiter
                 if island_id == 1 and mig_queue is not None:
                     best_tour_now = population[best_idx].copy()
-                    # Deep polish
-                    _candidate_or_opt_jit(best_tour_now, D, knn_idx, max_iters=500)
+                    # Deep polish (Use DLB)
+                    dlb_mask[:] = False
+                    _candidate_or_opt_jit(best_tour_now, D, knn_idx, max_iters=500, dlb_mask=dlb_mask)
                     try:
                         mig_queue.put(best_tour_now, block=True, timeout=1.0)
                         print(f"[Scout] RESTART BEQUEST SENT.")
