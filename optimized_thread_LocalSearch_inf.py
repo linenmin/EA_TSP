@@ -748,7 +748,7 @@ def rtr_challenge_jit(child, child_fit, pop, fit, W, rng_seed, best_idx):
     # 如果距离超过 15% (n * 0.15)，且 fitness 差距在 10% 以内，允许替换
     else:
         threshold_dist = n * 0.15  # 750 城市时，要求至少 112 条边不同
-        relax_factor = 1.1        # 允许差 10%
+        relax_factor = 1.05        # 允许差 10%
         
         if min_dist > threshold_dist and child_fit < target_fit * relax_factor:
             better = True
@@ -1199,7 +1199,7 @@ class r0123456:
                     
                     # 大幅增加打磨力度 (300 步)
                     # 既然种群要被销毁，多花时间打磨"遗孤"很划算
-                    polish_effort = 300
+                    polish_effort = 2000
                     
                     sent_count = 0
                     for idx in top_k:

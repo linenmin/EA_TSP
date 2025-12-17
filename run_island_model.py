@@ -220,8 +220,9 @@ def main():
     print(f"总进程数: {len(TARGET_FILES) * 2} (每个问题 2 个岛屿)")
     print("=" * 60)
     
-    # 收集所有进程
+    # 收集所有进程和队列
     all_processes = []
+    all_queues = []
     
     for target_csv in TARGET_FILES:
         if not os.path.exists(target_csv):
@@ -246,6 +247,9 @@ def main():
         # 为每个问题创建独立的通信队列
         q1 = multiprocessing.Queue(maxsize=10)
         q2 = multiprocessing.Queue(maxsize=10)
+        
+        # 收集队列用于后续清理
+        all_queues.extend([q1, q2])
         
         # 创建进程
         p1 = multiprocessing.Process(
@@ -286,6 +290,17 @@ def main():
             p.terminate()
         for p in all_processes:
             p.join(timeout=5)
+    
+    finally:
+        # 清理队列，防止死锁
+        for q in all_queues:
+            q.cancel_join_thread()  # 告诉 Python 不要等待写入完成
+            # 清空队列
+            try:
+                while True:
+                    q.get_nowait()
+            except:
+                pass
     
     print("\n" + "=" * 60)
     print("所有问题运行完成!")
