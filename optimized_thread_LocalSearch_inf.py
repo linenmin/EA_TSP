@@ -900,6 +900,75 @@ def rtr_challenge_jit(child, child_fit, pop, fit, W, rng_seed, best_idx):
     return better, target_idx
 
 
+@njit(cache=True, nogil=True)
+def _ruin_and_recreate_jit(tour: np.ndarray, D: np.ndarray, ruin_pct: float) -> np.ndarray:
+    """
+    Ruin & Recreate (LNS Operator) - ATSP Optimized
+    1. Ruin: 随机移除一段连续路径 (Segment Removal)
+    2. Recreate: 贪婪最佳插入 (Cheapest Insertion)
+    """
+    n = len(tour)
+    n_remove = int(n * ruin_pct)
+    if n_remove < 2: 
+        return tour.copy()
+    
+    # --- 1. Ruin: Remove Segment ---
+    # 随机选择起始点
+    start_idx = np.random.randint(0, n)
+    
+    # 提取被移除的城市 (注意处理循环边界)
+    removed_cities = np.empty(n_remove, dtype=np.int32)
+    kept_cities = np.empty(n - n_remove, dtype=np.int32)
+    
+    r_ptr = 0
+    k_ptr = 0
+    
+    # 简单的循环遍历来分离城市
+    end_idx = (start_idx + n_remove) % n
+    
+    if start_idx < end_idx:
+        # 移除的是中间一段 [start, end)
+        kept_cities[:start_idx] = tour[:start_idx]
+        kept_cities[start_idx:] = tour[end_idx:]
+        removed_cities[:] = tour[start_idx:end_idx]
+    else:
+        # 移除的是跨越边界的一段
+        kept_cities[:] = tour[end_idx:start_idx]
+        k = n - start_idx
+        removed_cities[:k] = tour[start_idx:]
+        removed_cities[k:] = tour[:end_idx]
+
+    # --- 2. Recreate: Cheapest Insertion ---
+    current_tour = kept_cities
+    np.random.shuffle(removed_cities) # Shuffle to randomize insertion order
+    
+    for city in removed_cities:
+        best_delta = 1e20
+        best_pos = -1
+        m = len(current_tour)
+        
+        # 寻找最佳插入位置 i: 插入到 u(i) -> v(i+1) 之间
+        # Delta = D[u, c] + D[c, v] - D[u, v]
+        
+        for i in range(m):
+            u = current_tour[i]
+            v = current_tour[(i + 1) % m]
+            
+            delta = D[u, city] + D[city, v] - D[u, v]
+            if delta < best_delta:
+                best_delta = delta
+                best_pos = i
+        
+        # 执行插入 (Rebuild array)
+        new_tour = np.empty(m + 1, dtype=np.int32)
+        new_tour[:best_pos+1] = current_tour[:best_pos+1]
+        new_tour[best_pos+1] = city
+        new_tour[best_pos+2:] = current_tour[best_pos+1:]
+        current_tour = new_tour
+
+    return current_tour
+
+
 @njit(cache=True, fastmath=True)
 def _double_bridge_jit(tour):
     """
@@ -1018,6 +1087,120 @@ class r0123456:
         # Symmetry flag (initialized in optimize)
         self._is_symmetric = True
 
+    def _run_lns_worker(self, D, n, mig_queue, recv_queue, island_id):
+        """
+        [New] Trauma Center (LNS Worker) Logic
+        Single-Trajectory Heterogeneous Scout.
+        """
+        # Init 32 nearest neighbors
+        finite_mask = ~np.isinf(D)
+        np.fill_diagonal(D, np.inf)
+        knn_idx = np.argsort(D, axis=1)[:, :32].astype(np.int32)
+        
+        # 1. Init Solution (Greedy)
+        current_tour = _rcl_nn_tour_jit(D, finite_mask, knn_idx, 3) # Strict greedy
+        current_fit = tour_length_jit(current_tour, D)
+        best_tour = current_tour.copy()
+        best_fit = current_fit
+        
+        # DLB Mask
+        dlb_mask = np.zeros(n, dtype=np.bool_)
+        
+        # Loop Vars
+        iter_count = 0
+        accepted_count = 0
+        received_count = 0
+        sent_count = 0
+        
+        print(f"[Scout LNS] Started. Initial Fit: {best_fit:.2f}")
+        
+        start_time = time.time()
+        
+        # Log handle setup
+        log_h = None
+        if self.log_file:
+            log_h = open(self.log_file, 'w', encoding='utf-8')
+            log_h.write("gen,best_fit,mean_fit,diversity,entropy,stagnation,migration,repulsion,rtr_accepts\n")
+        
+        while True:
+            iter_count += 1
+            migration_event = 0 # 1=Recv
+            repulsion_event = 0 # 1=Sent
+            
+            # --- A. Check Incoming Patients (from Exploiter) ---
+            if recv_queue is not None:
+                try:
+                    patient = recv_queue.get(block=False)
+                    p_fit = tour_length_jit(patient, D)
+                    current_tour[:] = patient[:]
+                    current_fit = p_fit
+                    dlb_mask[:] = False 
+                    received_count += 1
+                    migration_event = 1
+                    if received_count % 10 == 0:
+                         print(f"[Scout LNS] Received Patient #{received_count}. Fit: {p_fit:.2f}")
+                except:
+                    pass
+
+            # --- B. Ruin & Recreate (Kick) ---
+            # 20% Ruin Rate usually good for LNS
+            candidate = _ruin_and_recreate_jit(current_tour, D, 0.20)
+            
+            # Reset DLB for candidate (major structural change)
+            dlb_mask[:] = False 
+            
+            # --- C. Local Search (Rehabilitation) ---
+            # Deep Polish with DLB
+            _candidate_or_opt_jit(candidate, D, knn_idx, max_iters=500, dlb_mask=dlb_mask)
+            cand_fit = tour_length_jit(candidate, D)
+            
+            # --- D. Acceptance & Update ---
+            # 1. Global Best Update (Miracle Recovery)
+            if cand_fit < self.best_ever_fitness:
+                # Update Local Best
+                self.best_ever_fitness = cand_fit
+                best_tour[:] = candidate[:]
+                best_fit = cand_fit
+                
+                # Report
+                solution_to_report = self._rotate_to_start(best_tour, 0)
+                timeLeft = self.reporter.report(best_fit, best_fit, solution_to_report)
+                if timeLeft < 0: break
+                
+                # Send back to Exploiter immediately
+                if mig_queue is not None:
+                    try:
+                        mig_queue.put(best_tour.copy(), block=False)
+                        sent_count += 1
+                        repulsion_event = 1
+                        print(f"[Scout LNS] MIRACLE! Sent healed solution {best_fit:.2f} to Exploiter!")
+                    except:
+                        pass
+            
+            # 2. Local Acceptance (Current Solution Update)
+            # Accept if better or equal (Side-step allowed)
+            if cand_fit <= current_fit:
+                current_tour[:] = candidate[:]
+                current_fit = cand_fit
+                accepted_count += 1
+            else:
+                pass
+
+            if log_h:
+                row = f"{iter_count},{best_fit:.4f},{current_fit:.4f},0,0,0,{migration_event},{repulsion_event},0\n"
+                log_h.write(row)
+                if iter_count % 100 == 0: log_h.flush()
+
+            # Time Check (Interval)
+            if iter_count % 100 == 0:
+                elapsed = time.time() - self.reporter.startTime
+                if self.reporter.allowedTime > 0 and elapsed > self.reporter.allowedTime:
+                    break
+        
+        if log_h: log_h.close()
+        print(f"[Scout LNS] Finished. Recv: {received_count}, Sent: {sent_count}")
+        return 0
+
     def optimize(self, filename: str, mig_queue=None, recv_queue=None, island_id=0):
         """
         主优化流程：读取文件 -> 初始化 -> 进化循环 -> 上报结果
@@ -1031,9 +1214,19 @@ class r0123456:
 
         # 1.5 检查距离矩阵是否对称 (P0: Asymmetry Check)
         is_symmetric = np.allclose(D, D.T, rtol=1e-5, atol=1e-8, equal_nan=True)
+        self._is_symmetric = is_symmetric
         if not is_symmetric:
-            print(f"[Island {island_id}] [Warning] Asymmetric TSP detected! 2-Opt/Inversion disabled.")
-        self._is_symmetric = is_symmetric  # 保存到实例
+            print(f"[Island {island_id}] [Warning] Asymmetric TSP detected! Using Or-Opt/Insertion logic.")
+            
+        # Dispatch to LNS Worker if Island 1 (Configured as Scout/Doctor)
+        # Note: This hardcodes Island 1 as the LNS worker. 
+        # In a more flexible system we would pass a mode flag, but for this task this is sufficient.
+        if island_id == 1:
+            return self._run_lns_worker(D, n, mig_queue, recv_queue, island_id)
+            
+        # --- Normal GA Flow (Exploiter) ---
+        # If not LNS, execution continues here...
+        pass
 
         # 2. 预处理可行性掩码 (True 代表边存在/距离有限)
         finite_mask = np.isfinite(D)
@@ -1197,56 +1390,48 @@ class r0123456:
             # Pre-calc best_idx for export
             best_idx = np.argmin(fitness)
             
+            # --- D. Migration (Trauma Center Model) ---
+            # Exploiter (Island 0) Logic (Scout Logic is in _run_lns_worker)
+            
+            current_time = time.time()
+            if not hasattr(self, '_last_patient_sent'): self._last_patient_sent = 0.0
+
             if mig_queue is not None:
-                # 1. SCOUT (Island 1) -> EXPLOITER (Island 0)
-                # Scout 只有在重启前 (或定期) 发送最好的解
-                
-                # 这里我们保持一定的交互频率，但只发送 best
-                # 每 30 秒 check 一次
-                current_time = time.time()
-                time_since_last_send = current_time - _last_send_time
-                if time_since_last_send >= 30.0:
-                    _last_send_time = current_time
-                    
-                    if island_id == 1: # Scout 发送
-                         # 发送 Best
-                        migrant = population[best_idx].copy()
-                         # 额外打磨一下 (Use DLB)
-                        dlb_mask[:] = False
-                        _candidate_or_opt_jit(migrant, D, knn_idx, max_iters=500, dlb_mask=dlb_mask)
+                # 1. Send "Patient" (Stagnant Best) to Scout
+                # Trigger: Stagnation > Limit / 2 (Warning Phase)
+                if self.stagnation_counter > (self.stagnation_limit // 2):
+                    if current_time - self._last_patient_sent > 5.0: # 5 sec cooldown
+                        self._last_patient_sent = current_time
+                        best_idx = np.argmin(fitness) 
+                        patient = population[best_idx].copy() 
                         try:
-                            mig_queue.put(migrant, block=False)
-                            print(f"[Scout] Sent BEST to Exploiter.")
+                            mig_queue.put(patient, block=False)
                         except:
                             pass
-                            
-                # 2. Receive
+
+            if recv_queue is not None:
+                # 2. Receive "Healed" Solution from Scout
                 imported_count = 0
-                while recv_queue is not None:
+                while True:
                     try:
-                        guest = recv_queue.get(block=False)
-                        g_fit = tour_length_jit(guest, D)
+                        healed = recv_queue.get(block=False)
+                        h_fit = tour_length_jit(healed, D)
                         
-                        # Exploiter 接收逻辑:
-                        # 贪婪吸收: 只对比 g_fit 和 population worst?
-                        # 还是继续用 RTR? 
-                        # 用 RTR 比较稳妥，能保持多样性。
-                        # 但既然移除了 Repulsion，我们可以稍微放开一点。
+                        # Unconditional Acceptance: Replace Worst
+                        worst_idx = np.argmax(fitness)
+                        population[worst_idx][:] = healed[:]
+                        fitness[worst_idx] = h_fit
+                        imported_count += 1
                         
-                        seed = int(self.rng.integers(0, 1<<30))
-                        better, target_idx = rtr_challenge_jit(
-                            guest, g_fit, population, fitness, W, seed, -1 # -1 means no elite protection from external? or keep it
-                        )
-                        # Keep elite protection
-                        if target_idx == np.argmin(fitness) and g_fit >= fitness[target_idx]:
-                             pass # Don't replace best with worse
+                        # Update global best if miracle
+                        if h_fit < self.best_ever_fitness:
+                            self.best_ever_fitness = h_fit
+                            self.stagnation_counter = 0 # Reset stagnation
+                            print(f"[Exploiter] MIRACLE! Received Healed Solution {h_fit:.2f} (New Best)")
                         else:
-                             if g_fit < fitness[target_idx]: # 硬替换
-                                 population[target_idx][:] = guest[:]
-                                 fitness[target_idx] = g_fit
-                                 imported_count += 1
+                            pass
                     except:
-                        break
+                        break # Queue empty
                 
                 if imported_count > 0:
                     _migration_this_gen = True

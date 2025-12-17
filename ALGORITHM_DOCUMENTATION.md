@@ -129,3 +129,36 @@
 - **死前遗言 (Deathbed Bequest)**: Scout 在重启前，会将当前种群的最优解发送给 Exploiter，确保"侦察成果"不丢失。
 
 ---
+
+### 6. 当前性能诊断 (Status Diagnosis 2025-12-17)
+
+### 现状分析
+1.  **Exploiter (Island 0)**:
+    - **表现**: 引入 DLB 和 Kick 策略后，搜索效率大幅提升。Tour1000 最佳解达到 **58628** (远优于历史)。
+    - **瓶颈**: 随着代数增加，多样性下降，陷入局部最优后难以逃离。
+
+2.  **Scout (Island 1)**:
+    - **表现**: 严重落后。Tour500 中，Exploiter 已达 99k，Scout 重启多次后仍停留在 100k+。
+    - **问题**:
+        - **搜索浅层化**: 由于频繁重启 (Stagnation Limit ~100-200)，Scout 实际上是在反复进行"浅层爬山"，从未真正进入深层 Basin。
+        - **无效迁移**: 也是因为质量太差，发送给 Exploiter 的解 (Bequest) 几乎从未被接受 (Acceptance Rate < 2%)。
+    - **结论**: 当前的 "Mini-GA Scout" 模式对于大规模 Rugged Landscape 无效。
+
+## 7. Trauma Center Model (Phase 4 Implementation)
+针对上述问题，我们实施了 "Trauma Center" (创伤中心) 模型，彻底改造了 Island 1 (Scout) 的角色。
+
+- **Scout (Trauma Center)**:
+    - **模式**: **Single-Trajectory Iterated Local Search (ILS)** (不再是 GA)。
+    - **工作流 (Trauma Protocol)**:
+        1. **收治 (Admission)**: 接收 Exploiter 发来的停滞解 ("重症患者")，立即覆盖当前工作解。
+        2. **手术 (Surgery)**: 使用 **Ruin & Recreate** (Segment Removal + Cheapest Insertion) 破坏 20% 的结构。
+        3. **康复 (Rehab)**: 使用深度 **Or-Opt (with DLB)** 进行局搜。
+        4. **出院 (Discharge)**: 一旦发现更优解 (Global Best Improvement)，立即发回 Exploiter。
+    - **优势**: 无种群开销，迭代极快；Ruin 操作能打破 Exploiter 无法逃离的深坑。
+
+- **Exploiter (Society)**:
+    - **送诊**: 当停滞超过阈值的一半时，将当前最优解发送给 Scout。
+    - **接收**: 无条件接收 Scout 发回的 "Healed Solution"，替换种群中的最差个体。
+
+此架构实现了 **异构搜索 (Heterogeneous Search)**，结合了 GA 的群体挖掘能力和 ILS 的单点突破能力。
+---

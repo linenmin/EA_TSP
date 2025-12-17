@@ -88,45 +88,47 @@ def plot_events(df0, df1, output_file='events.png'):
     axes[0].legend()
     axes[0].grid(True, alpha=0.3)
     
-    # === Scout 发送: 识别 Reset 事件 ===
-    # Scout 每 50 代或更短时间重启一次。检测 stagnation 骤降。
-    stag_diff = df1['stagnation'].diff()
-    # Stagnation drop > 10 distincts a reset
-    restart_events = df1[stag_diff < -10]
     
-    if not restart_events.empty:
-        axes[1].scatter(restart_events['gen'], [1]*len(restart_events), 
-                       marker='^', s=100, c='green', edgecolors='darkgreen', 
-                       linewidths=2, label=f'Scout Reset & Send Best ({len(restart_events)} times)', zorder=5)
+    # === Trauma Center Events ===
+    # Exploiter Admissions (Patient Sent) - Assuming tracked via Repulsion or inferred
+    # Scout Admissions (Patient Received): df1['migration'] == 1
+    # Scout Discharges (Healed Sent): df1['repulsion'] == 1
     
-    axes[1].axhline(y=1, color='green', alpha=0.3, linestyle='--')
-    axes[1].set_ylabel('Scout Events')
-    axes[1].set_ylim(0.5, 1.5)
-    axes[1].set_yticks([1])
-    axes[1].set_yticklabels(['Reset/Send'])
-    axes[1].legend(loc='upper right')
+    # Plot Scout Admissions (Patients Received)
+    admissions = df1[df1['migration'] == 1]
+    if not admissions.empty:
+        axes[1].scatter(admissions['gen'], [1]*len(admissions), 
+                       marker='v', s=80, c='red', label=f'Trauma Center Admission ({len(admissions)})')
+    
+    # Plot Scout Discharges (Healed Sent)
+    discharges = df1[df1['repulsion'] == 1]
+    if not discharges.empty:
+        axes[1].scatter(discharges['gen'], [1]*len(discharges), 
+                       marker='^', s=100, c='green', edgecolors='black', 
+                       linewidths=2, label=f'Trauma Center Discharge ({len(discharges)})')
+                       
+    axes[1].set_ylabel('Events')
+    axes[1].set_title('Trauma Center Activity (Red=In, Green=Out)')
+    axes[1].set_yticks([])
+    axes[1].legend()
     axes[1].grid(True, alpha=0.3)
     
-    # === Exploiter 接收成功 ===
-    # migration 字段在 Exploiter 日志中标记为 1 表示有迁移并发生替换(直接替换或RTR胜出)
-    imports = df0[df0['migration'] == 1]
+    # === Exploiter Reception ===
+    # Exploiter Received Healed (migration=1)
+    healed = df0[df0['migration'] == 1]
+    if not healed.empty:
+        axes[2].scatter(healed['gen'], healed['best_fit'], 
+                       marker='*', s=150, c='gold', edgecolors='black', 
+                       label=f'Exploiter Received Healed ({len(healed)})', zorder=10)
     
-    if not imports.empty:
-        axes[2].scatter(imports['gen'], [1]*len(imports), 
-                       marker='v', s=100, c='blue', edgecolors='darkblue',
-                       linewidths=2, label=f'Exploiter Absorbed Scout Seed ({len(imports)} times)', zorder=5)
-        
-        # 尝试画垂直线连接 Scout 发送和 Exploiter 接收 (虽然时间轴上可能不完全对齐，但也很有趣)
-        axes[2].vlines(imports['gen'], 0.5, 1.5, color='blue', alpha=0.2)
-
-    axes[2].axhline(y=1, color='blue', alpha=0.3, linestyle='--')
-    axes[2].set_ylabel('Exploiter Imports')
-    axes[2].set_xlabel('Generation')
-    axes[2].set_ylim(0.5, 1.5)
-    axes[2].set_yticks([1])
-    axes[2].set_yticklabels(['Imported'])
-    axes[2].legend(loc='upper right')
+    axes[2].plot(df0['gen'], df0['best_fit'], label='Exploiter Fitness', alpha=0.5, color='blue')
+    axes[2].set_ylabel('Fitness')
+    axes[2].set_title('Exploiter Reception & Fitness Impact')
+    axes[2].legend()
     axes[2].grid(True, alpha=0.3)
+
+    
+
     
     plt.tight_layout()
     plt.savefig(output_file, dpi=150)
@@ -183,7 +185,7 @@ def main():
     # 用户配置区域：只需要填入日志文件夹路径
     # ==============================================================================
     
-    LOG_FOLDER = "logs_20251217_224448"  # 填入日志文件夹名称
+    LOG_FOLDER = "logs_20251217_225605"  # 填入日志文件夹名称
     
     # ==============================================================================
     
