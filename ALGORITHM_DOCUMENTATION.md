@@ -207,38 +207,85 @@ RTR 强制子代与"相似"的个体竞争，这意味着在搜索空间的不�
 
 ---
 
-## 5. 岛屿模型 (Island Model)
+## 5. 岛屿模型 (Hierarchical Selection Migration)
 
-### 架构
+### 架构演进
 
+经过多轮诊断分析，迁移策略从"注射式"进一步优化为**分层筛选迁移 (Hierarchical Selection)**。
+
+#### V1: 传统双向迁移 (已弃用)
+- 问题: Explorer 被 Exploiter "同化"，失去多样性
+
+#### V2: 注射式岛屿 (中间版本)
+- 问题: Explorer 只在发现改进时发送，时机不稳定；发送后立即重启，丢失积累
+
+#### V3: 分层筛选迁移 (当前版本)
 ```
-Island 0 (Exploiter)  ◄────────►  Island 1 (Explorer)
-   高选择压力 (k=5)                 低选择压力 (k=2)
-   低变异率 (0.3)                   高变异率 (0.8)
-   深度搜索 (ls=30)                 浅搜索 (ls=15)
+每 50 代:
+
+Explorer:
+  1. 接收 Exploiter 最优解 (用于距离计算)
+  2. 筛选前 30% 适应度 (质量门槛)
+  3. 选距离最大的 2% 个体 (多样性优先)
+  4. 对每个做 20 步 Or-Opt (发送前优化)
+  5. 发送给 Exploiter
+  6. 继续进化 (不重启)
+
+Exploiter:
+  1. 发送最优解给 Explorer (用于距离计算)
+  2. 接收 Explorer 的多样性注射
+  3. 用 RTR 融合
 ```
 
-**通信**: 每 50 代交换最优个体。
+### 发送策略详解
 
-### 为什么使用异构岛屿?
+| 环节 | 配置 | 说明 |
+|------|------|------|
+| **发送内容** | 分层筛选 | 前 30% 适应度 → 选距离最大的 |
+| **发送数量** | 2% 种群 | `max(1, int(λ * 0.02))` |
+| **发送时机** | 每 50 代 | 定期发送，不依赖改进检测 |
+| **发送前优化** | 20 步 Or-Opt | 提升质量，增加被 RTR 接受概率 |
+| **接收策略** | RTR | 窗口 W=20，与相似个体竞争 |
+| **发送后行为** | 继续进化 | 不重启，保留积累 |
 
-**问题**: 同构岛屿往往快速收敛到相同区域，失去并行优势。
+### 为什么使用分层筛选?
 
-**解决**: 
-- **Exploiter**: 负责精细优化当前最佳区域
-- **Explorer**: 负责探索新区域，避免"把所有鸡蛋放在一个篮子里"
+**核心洞察**: Exploiter 已经知道最优解长什么样了，它需要的是"不一样的结构"。
 
-### 排斥机制 (Repulsion)
-
-当两岛收敛到相同解时 (Bond Distance < 5% × n)，Explorer 岛触发**排斥重启**，强制逃离当前区域。
-
-**代码片段**:
 ```python
-if dist < repulsion_threshold:
-    print("[Island 1] REPULSION TRIGGERED! Scrambling...")
-    # 重新初始化种群
-    init_population_jit(population, ...)
+# 分层筛选逻辑
+# Step 1: 质量门槛 - 筛选前 30%
+quality_elite = sorted_indices[:int(λ * 0.3)]
+
+# Step 2: 多样性优先 - 选距离最大的
+distances = [bond_distance(individual, exploiter_best) for individual in quality_elite]
+selected = quality_elite[argsort(distances)[::-1][:send_count]]
+
+# Step 3: 发送前优化 - 20 步 Or-Opt
+for idx in selected:
+    _candidate_or_opt_jit(migrant, D, knn_idx, max_iters=20)
 ```
+
+### 角色分工
+
+| 角色 | Exploiter (Island 0) | Explorer (Island 1) |
+|------|---------------------|---------------------|
+| **使命** | 深度优化当前最佳区域 | 探索新区域，发送多样性 |
+| **选择压力** | k=5 (高) | k=2 (低) |
+| **变异率** | 0.3-0.4 | 0.6-0.8 |
+| **精英 LS** | 20% 精英, 完整步数 | 10% 精英, 5 步 |
+| **发送** | 最优解 (用于距离计算) | 分层筛选的多样性精英 |
+| **接收** | RTR 融合 | 仅存储用于距离计算 |
+
+### 设计决策
+
+| 决策 | 原因 |
+|------|------|
+| **定期发送** | 不依赖改进检测，稳定注入多样性 |
+| **质量门槛 30%** | 过滤掉太差的解，确保被 RTR 接受 |
+| **距离最大化** | 解决"发送重复解"的问题 |
+| **发送前 LS** | 提升解质量，增加 RTR 接受率 |
+| **不重启** | 保留 Explorer 的积累，避免多样性损失 |
 
 ---
 

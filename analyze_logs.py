@@ -152,38 +152,62 @@ def print_summary(df0, df1):
 
 def main():
     # ==============================================================================
-    # 用户配置区域：手动填入日志文件路径
+    # 用户配置区域：只需要填入日志文件夹路径
     # ==============================================================================
     
-    LOG_0 = "island_0_tour500_log.csv"  # Island 0 (Exploiter) 日志
-    LOG_1 = "island_1_tour500_log.csv"  # Island 1 (Explorer) 日志
-    
-    # 输出文件前缀 (可选，用于区分不同问题的图表)
-    OUTPUT_PREFIX = "tour500_"  # 例如: tour500_convergence.png
+    LOG_FOLDER = "logs_20251217_115250"  # 填入日志文件夹名称
     
     # ==============================================================================
     
-    print(f"正在分析: {LOG_0}, {LOG_1}")
-    
-    if not os.path.exists(LOG_0) or not os.path.exists(LOG_1):
-        print(f"错误：日志文件不存在！")
-        print(f"  {LOG_0}: {'存在' if os.path.exists(LOG_0) else '不存在'}")
-        print(f"  {LOG_1}: {'存在' if os.path.exists(LOG_1) else '不存在'}")
+    if not os.path.exists(LOG_FOLDER):
+        print(f"错误：文件夹 {LOG_FOLDER} 不存在！")
         return
     
-    df0, df1 = load_logs(LOG_0, LOG_1)
+    # 自动检测文件夹中的所有 CSV 文件
+    csv_files = [f for f in os.listdir(LOG_FOLDER) if f.endswith('_log.csv')]
     
-    # 生成图表 (带前缀)
-    plot_convergence(df0, df1, f"{OUTPUT_PREFIX}convergence.png")
-    plot_diversity(df0, df1, f"{OUTPUT_PREFIX}diversity.png")
-    plot_events(df0, df1, f"{OUTPUT_PREFIX}events.png")
-    plot_stagnation(df0, df1, f"{OUTPUT_PREFIX}stagnation.png")
+    if not csv_files:
+        print(f"错误：文件夹 {LOG_FOLDER} 中没有找到 CSV 日志文件！")
+        return
     
-    # 打印摘要
-    print_summary(df0, df1)
+    # 提取问题名称 (例如: island_0_tour500_log.csv -> tour500)
+    problem_names = set()
+    for f in csv_files:
+        # 格式: island_X_<problem>_log.csv
+        parts = f.replace('_log.csv', '').split('_')
+        if len(parts) >= 3:
+            problem_name = '_'.join(parts[2:])  # 支持包含下划线的问题名
+            problem_names.add(problem_name)
     
-    print(f"\n图表已保存: {OUTPUT_PREFIX}convergence.png, {OUTPUT_PREFIX}diversity.png, {OUTPUT_PREFIX}events.png, {OUTPUT_PREFIX}stagnation.png")
+    print(f"检测到 {len(problem_names)} 个问题: {sorted(problem_names)}")
+    print("=" * 60)
+    
+    # 为每个问题生成图表
+    for problem in sorted(problem_names):
+        log_0 = os.path.join(LOG_FOLDER, f"island_0_{problem}_log.csv")
+        log_1 = os.path.join(LOG_FOLDER, f"island_1_{problem}_log.csv")
+        
+        if not os.path.exists(log_0) or not os.path.exists(log_1):
+            print(f"[Skip] {problem}: 缺少日志文件")
+            continue
+        
+        print(f"\n正在分析: {problem}")
+        
+        df0, df1 = load_logs(log_0, log_1)
+        
+        # 输出路径 (存入同一文件夹)
+        prefix = os.path.join(LOG_FOLDER, f"{problem}_")
+        
+        # 生成图表
+        plot_convergence(df0, df1, f"{prefix}convergence.png")
+        plot_diversity(df0, df1, f"{prefix}diversity.png")
+        plot_events(df0, df1, f"{prefix}events.png")
+        plot_stagnation(df0, df1, f"{prefix}stagnation.png")
+        
+        # 打印摘要
+        print_summary(df0, df1)
+    
+    print(f"\n所有图表已保存到: {LOG_FOLDER}/")
 
 if __name__ == "__main__":
     main()
-

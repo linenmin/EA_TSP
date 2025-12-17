@@ -64,9 +64,17 @@ DEFAULT_CONFIG = {
 # ==============================================================================
 # 2. 岛屿角色修正 (Role Modifiers)
 # ==============================================================================
+# 迁移策略: 分层筛选迁移 (Hierarchical Selection)
+# - Explorer: 每 50 代发送 2% 种群 (前 30% 适应度 → 选距离最大的)
+# - 发送前做 20 步 Or-Opt
+# - 发送后不重启，继续进化
+# ==============================================================================
 def apply_role(base_config, role):
     """
     根据岛屿角色 (0=Exploiter, 1=Explorer) 应用问题特定的配置。
+    
+    Exploiter: 高选择压力、低变异率、深度 LS
+    Explorer: 低选择压力、高变异率、轻量 LS (5 步)
     """
     cfg = {"N_RUNS": base_config["N_RUNS"], "lam": base_config["lam"], "mu": base_config["lam"]}
     
@@ -77,11 +85,11 @@ def apply_role(base_config, role):
         cfg["ls_max_steps"] = base_config["exploit_ls"]
         cfg["stagnation_limit"] = int(base_config["stagnation_limit"] * 0.8)
         
-    else:  # Explorer (疯狂探索)
+    else:  # Explorer (多样性发生器)
         cfg["k_tournament"] = 2
         cfg["mutation_rate"] = base_config["explore_mut"]
         cfg["local_rate"] = 0.6
-        cfg["ls_max_steps"] = base_config["explore_ls"]
+        cfg["ls_max_steps"] = base_config["explore_ls"]  # 轻量 LS，实际在 optimize 中固定为 5 步
         cfg["stagnation_limit"] = int(base_config["stagnation_limit"] * 1.5)
         
     return cfg
@@ -113,11 +121,19 @@ def island_worker(island_id, config, csv_file, mig_queue, recv_queue, log_file=N
     solver.optimize(csv_file, mig_queue=mig_queue, recv_queue=recv_queue, island_id=island_id)
     
     print(f"[Launcher] Island {island_id} finished.")
-def run_single_problem(target_csv, enable_log=True):
-    """运行单个问题的双岛屿模型"""
+
+def run_single_problem(target_csv, enable_log=True, log_folder="."):
+    """运行单个问题的双岛屿模型
+    
+    Args:
+        target_csv: 目标 CSV 文件名
+        enable_log: 是否启用诊断日志
+        log_folder: 日志存放文件夹路径
+    """
     print("=" * 60)
     print(f"Starting Parallel Island Model (2 Islands)")
     print(f"Target: {target_csv}")
+    print(f"Log folder: {log_folder}")
     print("=" * 60)
     
     if not os.path.exists(target_csv):
@@ -138,10 +154,10 @@ def run_single_problem(target_csv, enable_log=True):
     q1 = multiprocessing.Queue(maxsize=10)
     q2 = multiprocessing.Queue(maxsize=10)
     
-    # 诊断日志文件路径
+    # 诊断日志文件路径 (存入时间戳文件夹)
     if enable_log:
-        log_0 = f"island_0_{target_csv.replace('.csv', '')}_log.csv"
-        log_1 = f"island_1_{target_csv.replace('.csv', '')}_log.csv"
+        log_0 = os.path.join(log_folder, f"island_0_{target_csv.replace('.csv', '')}_log.csv")
+        log_1 = os.path.join(log_folder, f"island_1_{target_csv.replace('.csv', '')}_log.csv")
         print(f"[Diagnostic] Logs: {log_0}, {log_1}")
     else:
         log_0 = None
@@ -190,6 +206,14 @@ def main():
     
     # ==============================================================================
     
+    # 创建时间戳文件夹存放日志
+    from datetime import datetime
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_folder = f"logs_{timestamp}"
+    if ENABLE_DIAGNOSTIC_LOG:
+        os.makedirs(log_folder, exist_ok=True)
+        print(f"[Diagnostic] Log folder: {log_folder}")
+    
     print("=" * 60)
     print(f"并行运行模式: {len(TARGET_FILES)} 个问题同时运行")
     print(f"问题列表: {TARGET_FILES}")
@@ -211,10 +235,10 @@ def main():
         
         print(f"[{target_csv}] Exploiter: lam={cfg0['lam']}, Explorer: lam={cfg1['lam']}")
         
-        # 诊断日志
+        # 诊断日志 (存入时间戳文件夹)
         if ENABLE_DIAGNOSTIC_LOG:
-            log_0 = f"island_0_{target_csv.replace('.csv', '')}_log.csv"
-            log_1 = f"island_1_{target_csv.replace('.csv', '')}_log.csv"
+            log_0 = os.path.join(log_folder, f"island_0_{target_csv.replace('.csv', '')}_log.csv")
+            log_1 = os.path.join(log_folder, f"island_1_{target_csv.replace('.csv', '')}_log.csv")
         else:
             log_0 = None
             log_1 = None
@@ -239,22 +263,28 @@ def main():
     
     print(f"\n启动 {len(all_processes)} 个进程...")
     
+    # 收集所有队列用于清理
+    all_queues = []
+    
     try:
         # 启动所有进程
         for p in all_processes:
             p.start()
         
-        # 等待所有进程完成
+        # 等待所有进程完成 (带超时)
         for p in all_processes:
-            p.join()
+            p.join(timeout=330)  # 5.5 分钟超时
+            if p.is_alive():
+                print(f"[Warning] Process {p.name} still alive, terminating...")
+                p.terminate()
+                p.join(timeout=5)
         
     except KeyboardInterrupt:
         print("\n[Launcher] 正在停止所有进程...")
         for p in all_processes:
             p.terminate()
         for p in all_processes:
-            p.join()
-        print("[Launcher] 已停止。")
+            p.join(timeout=5)
     
     print("\n" + "=" * 60)
     print("所有问题运行完成!")

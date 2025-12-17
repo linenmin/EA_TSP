@@ -1021,28 +1021,68 @@ class r0123456:
             
             # 每 50 代进行一次移民交换
             if mig_queue is not None and gen % 50 == 0:
-                # 1. Export: 发送当前最优个体
-                # 注意：发送副本，避免多进程共享内存问题
-                migrant = population[best_idx].copy()
-                try:
-                    # 非阻塞发送，如果满则丢弃
-                    mig_queue.put(migrant, block=False)
-                except:
-                    pass
                 
-                # 2. Import: 接收移民并尝试融合
-                # 注：Explorer (island_id=1) 完全不接收移民，保持纯粹探索
-                # 这实现了"注射式岛屿"模式：Explorer 只发送，从不接收
                 if island_id == 1:
-                    # Explorer: 清空接收队列但不处理（避免队列阻塞）
+                    # === Explorer 新迁移策略 ===
+                    # 1B: 分层筛选 (质量门槛30% + 距离最大)
+                    # 2A: 发送 2% 种群
+                    # 3A: 定期发送 (每 50 代)
+                    # 4A: 发送前 LS (20 步 Or-Opt)
+                    # 6A: 发送后继续进化 (不重启)
+                    
+                    # Step 1: 从 recv_queue 获取 Exploiter 最优解用于距离计算
+                    exploiter_best = None
                     while recv_queue is not None:
                         try:
-                            recv_queue.get(block=False)  # 丢弃
+                            exploiter_best = recv_queue.get(block=False)
                         except:
                             break
+                    
+                    # Step 2: 分层筛选
+                    # 2a: 筛选 fitness 前 30% 的个体
+                    quality_threshold = int(self.lam * 0.3)
+                    sorted_indices = np.argsort(fitness)
+                    quality_elite = sorted_indices[:quality_threshold]  # 前 30%
+                    
+                    # 2b: 在质量精英中，选择与 Exploiter 距离最大的
+                    send_count = max(1, int(self.lam * 0.02))  # 2% 种群
+                    
+                    if exploiter_best is not None:
+                        # 计算每个质量精英与 Exploiter 最优的距离
+                        distances = np.empty(len(quality_elite), dtype=np.float64)
+                        for i, idx in enumerate(quality_elite):
+                            distances[i] = bond_distance_jit(population[idx], exploiter_best)
+                        
+                        # 选择距离最大的 k 个
+                        distance_order = np.argsort(distances)[::-1]  # 降序
+                        selected_indices = quality_elite[distance_order[:send_count]]
+                    else:
+                        # 如果没有 Exploiter 信息，直接发送质量最好的
+                        selected_indices = quality_elite[:send_count]
+                    
+                    # Step 3: 发送前 LS (4A: 20 步 Or-Opt)
+                    for idx in selected_indices:
+                        migrant = population[idx].copy()
+                        _candidate_or_opt_jit(migrant, D, knn_idx, max_iters=20)
+                        try:
+                            mig_queue.put(migrant, block=False)
+                        except:
+                            break  # 队列满则停止
+                    
+                    print(f"[Island {island_id}] Sent {len(selected_indices)} diverse migrants (quality top 30%, max distance)")
+                    
+                    # 6A: 不重启，继续进化
                     imported_count = 0
                 else:
-                    # Exploiter: 正常接收移民
+                    # === Exploiter 迁移逻辑 ===
+                    # 1. Export: 发送最优个体给 Explorer (用于距离计算)
+                    migrant = population[best_idx].copy()
+                    try:
+                        mig_queue.put(migrant, block=False)
+                    except:
+                        pass
+                    
+                    # 2. Import: 接收 Explorer 的多样性注射
                     imported_count = 0
                     while recv_queue is not None:
                         try:
@@ -1085,31 +1125,8 @@ class r0123456:
                 div_dist, div_ent = calc_diversity_metrics_jit(population, population[best_idx])
                 print(f"Gen {gen:4d} | Best: {bestObjective:.2f} | Div: {div_dist:.1f} | Ent: {div_ent:.3f} (NEW BEST)")
                 
-                # --- Explorer 注射式岛屿模式 ---
-                # 当 Explorer 发现改进时：
-                # 1. 立即推送给 Exploiter
-                # 2. 自动重启种群，继续探索新区域
-                if island_id == 1 and mig_queue is not None:
-                    migrant = population[best_idx].copy()
-                    try:
-                        mig_queue.put(migrant, block=False)
-                        print(f"[Island {island_id}] INJECTION: Found improvement {bestObjective:.2f}, pushing to Exploiter & restarting...")
-                        
-                        # === 自动重启种群 (神风特攻队模式) ===
-                        # 发送后立即重启，继续探索新区域
-                        seeds = np.empty(self.lam, dtype=np.int64)
-                        for k in range(self.lam): seeds[k] = int(self.rng.integers(1<<30))
-                        strat_probs = np.array([0.1, 0.8, 0.1], dtype=np.float64)
-                        rcl_r = int(self.rng.integers(5, 15))
-                        
-                        init_population_jit(population, D, finite_mask, knn_idx, strat_probs, seeds, rcl_r)
-                        batch_lengths_jit(population, D, fitness)
-                        
-                        # 重置停滞计数
-                        self.stagnation_counter = 0
-                        
-                    except:
-                        pass  # 队列满则丢弃
+                # 注：旧的 Explorer 注射逻辑已移除
+                # 现在 Explorer 每 50 代定期发送，使用分层筛选策略
                 
             else:
                 self.stagnation_counter += 1
