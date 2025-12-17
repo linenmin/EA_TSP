@@ -705,13 +705,13 @@ def calc_diversity_metrics_jit(pop, best_tour):
 
 
 @njit(cache=True, fastmath=True)
-def rtr_challenge_jit(child, child_fit, pop, fit, W, rng_seed):
+def rtr_challenge_jit(child, child_fit, pop, fit, W, rng_seed, best_idx):
     """
     RTR (Restricted Tournament Replacement) 带多样性豁免 + 精英保护
     
     新增逻辑:
     1. 如果 child 与 target 距离足够远，即使 fitness 稍差也允许替换
-    2. 永远不允许替换种群中的最优个体
+    2. 永远不允许替换种群中的最优个体 (best_idx 由外部预计算传入)
     """
     m = pop.shape[0]
     n = child.shape[0]  # 城市数量
@@ -734,14 +734,7 @@ def rtr_challenge_jit(child, child_fit, pop, fit, W, rng_seed):
     target_idx = closest_idx
     target_fit = fit[target_idx]
     
-    # === 精英保护: 永远不允许替换最优个体 ===
-    best_idx = 0
-    best_fit = fit[0]
-    for i in range(1, m):
-        if fit[i] < best_fit:
-            best_fit = fit[i]
-            best_idx = i
-    
+    # === 精英保护: best_idx 由外部传入，避免 O(m) 开销 ===
     if target_idx == best_idx:
         return False, target_idx  # 保护精英
     
@@ -753,7 +746,6 @@ def rtr_challenge_jit(child, child_fit, pop, fit, W, rng_seed):
     
     # 逻辑 B: 多样性豁免 (Diversity Exemption)
     # 如果距离超过 15% (n * 0.15)，且 fitness 差距在 10% 以内，允许替换
-    # 这让 Explorer 的异构解能存活下来
     else:
         threshold_dist = n * 0.15  # 750 城市时，要求至少 112 条边不同
         relax_factor = 1.1        # 允许差 10%
@@ -1022,13 +1014,16 @@ class r0123456:
             # 由于需要修改 population，这里串行执行最为安全
             # 如果 bottleneck，可以将整个循环 JIT 化
             
+            # 预计算 best_idx，避免在 RTR 中重复计算 O(m) 次
+            current_best_idx = np.argmin(fitness)
+            
             for i in range(self.lam):
                 # 调用 JIT 函数寻找窗口中最像的个体并决定是否替换
                 # 为了随机性，我们需要传入随机种子
                 seed = int(self.rng.integers(0, 1<<30))
                 
                 better, target_idx = rtr_challenge_jit(
-                    c_pop[i], c_fit[i], population, fitness, W, seed
+                    c_pop[i], c_fit[i], population, fitness, W, seed, current_best_idx
                 )
                 
                 if better:
@@ -1116,9 +1111,11 @@ class r0123456:
                             # 使用 RTR 逻辑尝试插入移民
                             g_fit = tour_length_jit(guest, D)
                             
+                            # 预计算 best_idx
+                            current_best_idx = np.argmin(fitness)
                             seed = int(self.rng.integers(0, 1<<30))
                             better, target_idx = rtr_challenge_jit(
-                                guest, g_fit, population, fitness, W, seed
+                                guest, g_fit, population, fitness, W, seed, current_best_idx
                             )
                             
                             if better:
