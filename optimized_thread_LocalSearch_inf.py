@@ -707,10 +707,11 @@ def calc_diversity_metrics_jit(pop, best_tour):
 @njit(cache=True, fastmath=True)
 def rtr_challenge_jit(child, child_fit, pop, fit, W, rng_seed):
     """
-    RTR (Restricted Tournament Replacement) 带多样性豁免机制
+    RTR (Restricted Tournament Replacement) 带多样性豁免 + 精英保护
     
-    新增逻辑: 如果 child 与 target 距离足够远 (独特性高)，
-    即使 fitness 稍差也允许替换，以保护多样性。
+    新增逻辑:
+    1. 如果 child 与 target 距离足够远，即使 fitness 稍差也允许替换
+    2. 永远不允许替换种群中的最优个体
     """
     m = pop.shape[0]
     n = child.shape[0]  # 城市数量
@@ -729,9 +730,20 @@ def rtr_challenge_jit(child, child_fit, pop, fit, W, rng_seed):
             min_dist = dist
             closest_idx = idx
             
-    # 3. 竞争 (带多样性豁免)
+    # 3. 竞争 (带多样性豁免 + 精英保护)
     target_idx = closest_idx
     target_fit = fit[target_idx]
+    
+    # === 精英保护: 永远不允许替换最优个体 ===
+    best_idx = 0
+    best_fit = fit[0]
+    for i in range(1, m):
+        if fit[i] < best_fit:
+            best_fit = fit[i]
+            best_idx = i
+    
+    if target_idx == best_idx:
+        return False, target_idx  # 保护精英
     
     better = False
     
@@ -740,11 +752,11 @@ def rtr_challenge_jit(child, child_fit, pop, fit, W, rng_seed):
         better = True
     
     # 逻辑 B: 多样性豁免 (Diversity Exemption)
-    # 如果距离超过 15% (n * 0.15)，且 fitness 差距在 2% 以内，允许替换
+    # 如果距离超过 15% (n * 0.15)，且 fitness 差距在 10% 以内，允许替换
     # 这让 Explorer 的异构解能存活下来
     else:
         threshold_dist = n * 0.15  # 750 城市时，要求至少 112 条边不同
-        relax_factor = 1.1        # 允许差 2%
+        relax_factor = 1.1        # 允许差 10%
         
         if min_dist > threshold_dist and child_fit < target_fit * relax_factor:
             better = True
