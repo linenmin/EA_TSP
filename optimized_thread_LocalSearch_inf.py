@@ -744,7 +744,7 @@ def rtr_challenge_jit(child, child_fit, pop, fit, W, rng_seed):
     # 这让 Explorer 的异构解能存活下来
     else:
         threshold_dist = n * 0.15  # 750 城市时，要求至少 112 条边不同
-        relax_factor = 1.02        # 允许差 2%
+        relax_factor = 1.1        # 允许差 2%
         
         if min_dist > threshold_dist and child_fit < target_fit * relax_factor:
             better = True

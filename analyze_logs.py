@@ -95,7 +95,7 @@ def plot_events(df0, df1, output_file='events.png'):
     
     axes[1].scatter(restart_events['gen'], [1]*len(restart_events), 
                    marker='o', s=100, c='orange', edgecolors='darkorange', 
-                   linewidths=2, label=f'Explorer 死前遗言发送 ({len(restart_events)} 次)', zorder=5)
+                   linewidths=2, label=f'Explorer deadbed bequest ({len(restart_events)} times)', zorder=5)
     axes[1].axhline(y=1, color='orange', alpha=0.3, linestyle='--')
     axes[1].set_ylabel('Explorer Sends')
     axes[1].set_ylim(0.5, 1.5)
@@ -108,7 +108,7 @@ def plot_events(df0, df1, output_file='events.png'):
     imports = df0[df0['migration'] == 1]
     axes[2].scatter(imports['gen'], [1]*len(imports), 
                    marker='o', s=100, c='blue', edgecolors='darkblue',
-                   linewidths=2, label=f'Exploiter 接收成功 ({len(imports)} 次)', zorder=5)
+                   linewidths=2, label=f'Exploiter received successfully ({len(imports)} times)', zorder=5)
     axes[2].axhline(y=1, color='blue', alpha=0.3, linestyle='--')
     axes[2].set_ylabel('Exploiter Imports')
     axes[2].set_xlabel('Generation')
@@ -170,7 +170,7 @@ def main():
     # 用户配置区域：只需要填入日志文件夹路径
     # ==============================================================================
     
-    LOG_FOLDER = "logs_20251217_122354"  # 填入日志文件夹名称
+    LOG_FOLDER = "logs_20251217_140510"  # 填入日志文件夹名称
     
     # ==============================================================================
     
