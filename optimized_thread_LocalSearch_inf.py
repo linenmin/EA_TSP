@@ -6,7 +6,7 @@ import Reporter  # 导入课程提供的结果上报器，用于提交结果
 import numpy as np  # 导入NumPy库用于高效数值计算
 from typing import List, Optional  # 导入类型提示
 import os  # 导入操作系统接口
-
+import time
 # -------- 环境变量配置 (Environment Configuration) --------
 # 限制底层数学库的线程数，防止与上层并行冲突
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
@@ -871,6 +871,8 @@ class r0123456:
         # 诊断日志
         self.log_file = log_file
         self._log_handle = None
+        # Symmetry flag (initialized in optimize)
+        self._is_symmetric = True
 
     def optimize(self, filename: str, mig_queue=None, recv_queue=None, island_id=0):
         """
@@ -886,7 +888,7 @@ class r0123456:
         # 1.5 检查距离矩阵是否对称 (P0: Asymmetry Check)
         is_symmetric = np.allclose(D, D.T, rtol=1e-5, atol=1e-8, equal_nan=True)
         if not is_symmetric:
-            print(f"[Island {island_id}] [Warning] Asymmetric TSP detected! Using Or-Opt only.")
+            print(f"[Island {island_id}] [Warning] Asymmetric TSP detected! 2-Opt/Inversion disabled.")
         self._is_symmetric = is_symmetric  # 保存到实例
 
         # 2. 预处理可行性掩码 (True 代表边存在/距离有限)
@@ -919,7 +921,7 @@ class r0123456:
         batch_lengths_jit(population, D, fitness)
 
         # 7. RTR (Restricted Tournament Replacement) Setup
-        print(f"[Info] Using Restricted Tournament Replacement (RTR). W=20.")
+        print(f"[Info] Using Restricted Tournament Replacement (RTR). W=50.")
         
         # 预分配 offspring buffer (batch size = lam or smaller chunk)
         # 为方便与 JIT 配合并保持逻辑清晰，我们生成一整代子代，然后逐个进行 RTR 竞争
@@ -935,8 +937,8 @@ class r0123456:
         # 父代索引 (用于繁殖选择)
         indices = np.arange(self.lam, dtype=np.int32)
         
-        # 窗口大小
-        W = min(self.lam, 20)
+        # 窗口大小 (Updated to 50 for better diversity maintenance)
+        W = min(self.lam, 50)
         
         # --- 诊断日志初始化 ---
         if self.log_file:
@@ -949,6 +951,7 @@ class r0123456:
         _migration_this_gen = False
         _repulsion_this_gen = False
         _rtr_accepts = 0
+        _last_send_time = time.time()  # 基于时间的发送间隔追踪
         
         print("Gen | Best Cost | Avg Bonds | Edge Ent", flush=True)
 
@@ -967,7 +970,7 @@ class r0123456:
                 c1 = _ox_jit(population[idx1], population[idx2])
                 c2 = _ox_jit(population[idx2], population[idx1])
                 
-                # Mutation
+                # Mutation (Check Symmetry!)
                 if self.rng.random() < self.mutation_rate:
                     self._hybrid_mutation_inplace(c1)
                 if self.rng.random() < self.mutation_rate:
@@ -987,27 +990,19 @@ class r0123456:
             
             # --- P3: Elite-Only Local Search (精英优先 LS) ---
             # Exploiter: 强力 LS (20% 精英, 完整步数)
-            # Explorer: 轻量 LS (10% 精英, 5 步) - 提升解质量但保持探索速度
-            if island_id == 0:  # Exploiter: 强力 LS
-                elite_ratio = 0.2
-                elite_count = max(1, int(self.lam * elite_ratio))
-                elite_indices = np.argsort(c_fit)[:elite_count]
-                
-                for idx in elite_indices:
-                    _candidate_or_opt_jit(c_pop[idx], D, knn_idx, max_iters=self.ls_max_steps)
-                
-                for idx in elite_indices:
-                    c_fit[idx] = tour_length_jit(c_pop[idx], D)
-            else:  # Explorer: 轻量 LS (仅 5 步，提升竞争力以增加注射机会)
-                elite_ratio = 0.1  # 只对 10% 精英做 LS
-                elite_count = max(1, int(self.lam * elite_ratio))
-                elite_indices = np.argsort(c_fit)[:elite_count]
-                
-                for idx in elite_indices:
-                    _candidate_or_opt_jit(c_pop[idx], D, knn_idx, max_iters=5)  # 仅 5 步
-                
-                for idx in elite_indices:
-                    c_fit[idx] = tour_length_jit(c_pop[idx], D)
+            # Explorer (Scout): 强力 LS (Scout 模式下也要保证质量)
+            
+            # 简化策略: 所有岛屿都对前 20% 精英做 LS (保证 Scout 也产出高质量解)
+            # 区别在于 Scout 会频繁重启，Exploiter 持续深挖
+            elite_ratio = 0.2
+            elite_count = max(1, int(self.lam * elite_ratio))
+            elite_indices = np.argsort(c_fit)[:elite_count]
+            
+            for idx in elite_indices:
+                _candidate_or_opt_jit(c_pop[idx], D, knn_idx, max_iters=self.ls_max_steps)
+            
+            for idx in elite_indices:
+                c_fit[idx] = tour_length_jit(c_pop[idx], D)
             
             # --- B. RTR Replacement ---
             # 逐个子代尝试替换
@@ -1031,104 +1026,63 @@ class r0123456:
                     fitness[target_idx] = c_fit[i]
                     _rtr_accepts += 1  # 诊断日志：记录 RTR 接受数
 
-            # --- D. Migration (Island Model) ---
+            # --- D. Migration (Scout Model) ---
             # Pre-calc best_idx for export
             best_idx = np.argmin(fitness)
             
-            # 发送频率: Explorer 25 代，Exploiter 50 代
-            # Explorer 更频繁发送以捕捉重启前的窗口
-            send_interval = 25 if island_id == 1 else 50
-            
-            if mig_queue is not None and gen % send_interval == 0:
+            if mig_queue is not None:
+                # 1. SCOUT (Island 1) -> EXPLOITER (Island 0)
+                # Scout 只有在重启前 (或定期) 发送最好的解
                 
-                if island_id == 1:
-                    # === Explorer 分层筛选迁移 ===
-                    # 1B: 分层筛选 (质量门槛30% + 距离最大)
-                    # 2A: 发送 2% 种群
-                    # 3A: 定期发送 (每 25 代)
-                    # 4A: 发送前 LS (20 步 Or-Opt)
-                    # 6A: 发送后继续进化 (不重启)
+                # 这里我们保持一定的交互频率，但只发送 best
+                # 每 30 秒 check 一次
+                current_time = time.time()
+                time_since_last_send = current_time - _last_send_time
+                if time_since_last_send >= 30.0:
+                    _last_send_time = current_time
                     
-                    # Step 1: 从 recv_queue 获取 Exploiter 最优解用于距离计算
-                    exploiter_best = None
-                    while recv_queue is not None:
-                        try:
-                            exploiter_best = recv_queue.get(block=False)
-                        except:
-                            break
-                    
-                    # Step 2: 分层筛选
-                    # 2a: 筛选 fitness 前 30% 的个体
-                    quality_threshold = int(self.lam * 0.3)
-                    sorted_indices = np.argsort(fitness)
-                    quality_elite = sorted_indices[:quality_threshold]  # 前 30%
-                    
-                    # 2b: 在质量精英中，选择与 Exploiter 距离最大的
-                    send_count = max(1, int(self.lam * 0.02))  # 2% 种群
-                    
-                    if exploiter_best is not None:
-                        # 计算每个质量精英与 Exploiter 最优的距离
-                        distances = np.empty(len(quality_elite), dtype=np.float64)
-                        for i, idx in enumerate(quality_elite):
-                            distances[i] = bond_distance_jit(population[idx], exploiter_best)
-                        
-                        # 选择距离最大的 k 个
-                        distance_order = np.argsort(distances)[::-1]  # 降序
-                        selected_indices = quality_elite[distance_order[:send_count]]
-                    else:
-                        # 如果没有 Exploiter 信息，直接发送质量最好的
-                        selected_indices = quality_elite[:send_count]
-                    
-                    # Step 3: 发送前 LS (4A: 20 步 Or-Opt)
-                    for idx in selected_indices:
-                        migrant = population[idx].copy()
-                        _candidate_or_opt_jit(migrant, D, knn_idx, max_iters=20)
+                    if island_id == 1: # Scout 发送
+                         # 发送 Best
+                        migrant = population[best_idx].copy()
+                         # 额外打磨一下
+                        _candidate_or_opt_jit(migrant, D, knn_idx, max_iters=500)
                         try:
                             mig_queue.put(migrant, block=False)
+                            print(f"[Scout] Sent BEST to Exploiter.")
                         except:
-                            break  # 队列满则停止
-                    
-                    print(f"[Island {island_id}] Sent {len(selected_indices)} diverse migrants (quality top 30%, max distance)")
-                    
-                    # 6A: 不重启，继续进化
-                    imported_count = 0
-                else:
-                    # === Exploiter 迁移逻辑 ===
-                    # 1. Export: 发送最优个体给 Explorer (用于距离计算)
-                    migrant = population[best_idx].copy()
+                            pass
+                            
+                # 2. Receive
+                imported_count = 0
+                while recv_queue is not None:
                     try:
-                        mig_queue.put(migrant, block=False)
+                        guest = recv_queue.get(block=False)
+                        g_fit = tour_length_jit(guest, D)
+                        
+                        # Exploiter 接收逻辑:
+                        # 贪婪吸收: 只对比 g_fit 和 population worst?
+                        # 还是继续用 RTR? 
+                        # 用 RTR 比较稳妥，能保持多样性。
+                        # 但既然移除了 Repulsion，我们可以稍微放开一点。
+                        
+                        seed = int(self.rng.integers(0, 1<<30))
+                        better, target_idx = rtr_challenge_jit(
+                            guest, g_fit, population, fitness, W, seed, -1 # -1 means no elite protection from external? or keep it
+                        )
+                        # Keep elite protection
+                        if target_idx == np.argmin(fitness) and g_fit >= fitness[target_idx]:
+                             pass # Don't replace best with worse
+                        else:
+                             if g_fit < fitness[target_idx]: # 硬替换
+                                 population[target_idx][:] = guest[:]
+                                 fitness[target_idx] = g_fit
+                                 imported_count += 1
                     except:
-                        pass
-                    
-                    # 2. Import: 接收 Explorer 的多样性注射
-                    imported_count = 0
-                    while recv_queue is not None:
-                        try:
-                            guest = recv_queue.get(block=False)
-                            
-                            # Normal Migration (RTR Insertion)
-                            # 使用 RTR 逻辑尝试插入移民
-                            g_fit = tour_length_jit(guest, D)
-                            
-                            # 预计算 best_idx
-                            current_best_idx = np.argmin(fitness)
-                            seed = int(self.rng.integers(0, 1<<30))
-                            better, target_idx = rtr_challenge_jit(
-                                guest, g_fit, population, fitness, W, seed, current_best_idx
-                            )
-                            
-                            if better:
-                                population[target_idx][:] = guest[:]
-                                fitness[target_idx] = g_fit
-                                imported_count += 1
-                        except:
-                            # 队列空
-                            break
+                        break
                 
                 if imported_count > 0:
-                    _migration_this_gen = True  # 诊断日志
-                    print(f"[Island {island_id}] Imported {imported_count} migrants.")
+                    _migration_this_gen = True
+                    # print(f"[Island {island_id}] Imported {imported_count}.")
 
             # --- E. Reporting & Metrics ---
             # best_idx 已经在上面更新过
@@ -1146,9 +1100,6 @@ class r0123456:
                 div_dist, div_ent = calc_diversity_metrics_jit(population, population[best_idx])
                 print(f"Gen {gen:4d} | Best: {bestObjective:.2f} | Div: {div_dist:.1f} | Ent: {div_ent:.3f} (NEW BEST)")
                 _diversity_computed = True  # 标记已计算
-                
-                # 注：旧的 Explorer 注射逻辑已移除
-                # 现在 Explorer 每 50 代定期发送，使用分层筛选策略
                 
             else:
                 self.stagnation_counter += 1
@@ -1187,32 +1138,17 @@ class r0123456:
             if self.stagnation_counter >= self.stagnation_limit:
                 print(f"!! STAGNATION ({self.stagnation_counter} gens) -> RESTART !!")
                 
-                # =================================================================
-                # 【FIX】: 死前遗言 (Deathbed Bequest)
-                # Explorer 在重启前发送当前种群的峰值解，防止成果丢失
-                # =================================================================
+                # Scout (Island 1) 在重启前发送 Best 给 Exploiter
                 if island_id == 1 and mig_queue is not None:
-                    # 此时的 population 处于局部最优峰值，质量极高
-                    # 发送当前种群中最优秀的前 3 名
-                    sorted_indices = np.argsort(fitness)
-                    top_k = sorted_indices[:3]
-                    
-                    # 大幅增加打磨力度 (300 步)
-                    # 既然种群要被销毁，多花时间打磨"遗孤"很划算
-                    polish_effort = 2000
-                    
-                    sent_count = 0
-                    for idx in top_k:
-                        migrant = population[idx].copy()
-                        _candidate_or_opt_jit(migrant, D, knn_idx, max_iters=polish_effort)
-                        try:
-                            mig_queue.put(migrant, block=False)
-                            sent_count += 1
-                        except:
-                            break
-                    print(f"[Island {island_id}] DEATHBED BEQUEST: Sent {sent_count} polished (steps={polish_effort}) solutions.")
-                # =================================================================
-                
+                    best_tour_now = population[best_idx].copy()
+                    # Deep polish
+                    _candidate_or_opt_jit(best_tour_now, D, knn_idx, max_iters=500)
+                    try:
+                        mig_queue.put(best_tour_now, block=True, timeout=1.0)
+                        print(f"[Scout] RESTART BEQUEST SENT.")
+                    except:
+                        pass
+
                 best_tour_ever = population[best_idx].copy()
                 
                 seeds = np.random.randint(0, 1<<30, self.lam).astype(np.int64)
@@ -1231,54 +1167,23 @@ class r0123456:
             # Time check done above
 
         
-        # ==================== Final Polish (Double Bridge + Deep 2-Opt) ====================
-        print(f"[Island {island_id}] Final Polish: Running Double Bridge + Deep 2-Opt cycles...")
+        # ==================== Final Stage ====================
+        # Removed Polish (Double Bridge + 2-Opt) as requested.
+        # Just report the final result one last time.
+        
         best_idx = np.argmin(fitness)
-        best_tour = population[best_idx].copy()
-        best_fit = tour_length_jit(best_tour, D)
+        bestObjective = float(fitness[best_idx])
+        bestSolution = self._rotate_to_start(population[best_idx].copy(), 0)
         
-        # Double Bridge 多轮尝试：扰动 -> 深度 2-Opt 优化 -> 检查是否改进
-        # 这能突破 2-Opt 的局部最优陷阱
-        POLISH_ROUNDS = 30  # 增加到 30 轮，给更多逃逸机会
-        DEEP_LS_STEPS = 500  # 每轮扰动后跑 500 步深度优化
-        
-        improved = False
-        for r in range(POLISH_ROUNDS):
-            # 保存当前最优的副本
-            candidate = best_tour.copy()
-            
-            # 1. Double Bridge 扰动
-            _double_bridge_jit(candidate)
-            
-            # 2. 深度 2-Opt 优化 (纯 2-Opt，更可靠)
-            for _ in range(DEEP_LS_STEPS):
-                if not _two_opt_once_jit_safe(candidate, D):
-                    break
-            
-            # 3. 评估
-            candidate_fit = tour_length_jit(candidate, D)
-            if candidate_fit < best_fit:
-                best_tour[:] = candidate[:]
-                best_fit = candidate_fit
-                improved = True
-                print(f"[Island {island_id}] Polish Round {r+1}: {self.best_ever_fitness:.2f} -> {best_fit:.2f} (IMPROVED)")
-        
-        if best_fit < self.best_ever_fitness:
-            print(f"[Island {island_id}] Final Polish SUCCESS: {self.best_ever_fitness:.2f} -> {best_fit:.2f}")
-            self.best_ever_fitness = best_fit
-            bestSolution = self._rotate_to_start(best_tour.copy(), 0)
-            # One last report
-            self.reporter.report(best_fit, best_fit, bestSolution)
-        else:
-            print(f"[Island {island_id}] Final Polish found no improvement.")
-        
+        print(f"[Island {island_id}] Finished. Final Best: {bestObjective:.2f}")
+        self.reporter.report(bestObjective, bestObjective, bestSolution)
+
         # --- 关闭诊断日志 ---
         if self._log_handle:
             self._log_handle.close()
             self._log_handle = None
               
         return 0
-
     # -------- 辅助方法 (Helpers) --------
 
     def _k_tournament_idx(self, fitness: np.ndarray, k: int) -> int:
@@ -1295,7 +1200,13 @@ class r0123456:
     def _hybrid_mutation_inplace(self, tour: np.ndarray) -> None:
         """混合变异：70% 反转 (Inversion), 30% 插入 (Insertion)"""
         n = tour.shape[0]
-        if self.rng.random() < 0.7:
+        
+        # P0: Asymmetry Check
+        use_inversion = True
+        if not self._is_symmetric:
+            use_inversion = False # Force Insertion
+            
+        if use_inversion and self.rng.random() < 0.7:
             # 反转变异 [i, j)
             i = int(self.rng.integers(0, n - 1))
             j = int(self.rng.integers(i + 1, n))
@@ -1317,6 +1228,12 @@ class r0123456:
 
     def _light_two_opt_inplace(self, tour: np.ndarray, D: np.ndarray, finite_mask: np.ndarray, max_steps: int):
         """调用 JIT 版局部搜索 (混合 2-opt 和 Or-opt)"""
+        # P0: If Asymmetric, DISABLE 2-Opt
+        if not self._is_symmetric:
+            bs = int(self.rng.integers(1, 4))
+            _or_opt_once_jit(tour, D, bs)
+            return
+
         steps = int(max_steps)
         for _ in range(steps):
              # 80% 概率做 2-opt, 20% 概率做 Or-opt
@@ -1335,6 +1252,10 @@ class r0123456:
 
     def _repair_inplace(self, tour: np.ndarray, D: np.ndarray, finite_mask: np.ndarray):
         """调用 JIT 版修复逻辑"""
+        # P0: If Asymmetric, DISABLE 2-Opt based repair
+        if not self._is_symmetric:
+            return
+            
         _repair_jit(tour, D, finite_mask)
 
     def _tour_feasible(self, tour: np.ndarray, finite_mask: np.ndarray) -> bool:

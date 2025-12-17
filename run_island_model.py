@@ -5,6 +5,13 @@ import os
 import random
 from optimized_thread_LocalSearch_inf import r0123456
 
+# ==============================================================================
+# 全局开关
+# ==============================================================================
+# ==============================================================================
+# 全局开关
+# ==============================================================================
+ENABLE_MIGRATION = True  # Enable for Scout -> Exploiter flow
 
 # ==============================================================================
 # 1. 基础问题配置 (Base Configs per Problem)
@@ -64,33 +71,32 @@ DEFAULT_CONFIG = {
 # ==============================================================================
 # 2. 岛屿角色修正 (Role Modifiers)
 # ==============================================================================
-# 迁移策略: 分层筛选迁移 (Hierarchical Selection)
-# - Explorer: 每 50 代发送 2% 种群 (前 30% 适应度 → 选距离最大的)
-# - 发送前做 20 步 Or-Opt
-# - 发送后不重启，继续进化
+# 迁移策略: Scout -> Exploiter (One Way)
+# - Scout: 小种群, 强 LS, 频繁重启. 发送 Best 给 Exploiter.
+# - Exploiter: 正常进化, 接收 Scout 的 Best (贪婪吸收).
 # ==============================================================================
 def apply_role(base_config, role):
     """
-    根据岛屿角色 (0=Exploiter, 1=Explorer) 应用问题特定的配置。
-    
-    Exploiter: 高选择压力、低变异率、深度 LS
-    Explorer: 低选择压力、高变异率、轻量 LS (5 步)
+    根据岛屿角色 (0=Exploiter, 1=Scout) 应用配置。
     """
     cfg = {"N_RUNS": base_config["N_RUNS"], "lam": base_config["lam"], "mu": base_config["lam"]}
     
     if role == 0:  # Exploiter (精耕细作)
         cfg["k_tournament"] = 5
         cfg["mutation_rate"] = base_config["exploit_mut"]
-        cfg["local_rate"] = 1.0  # 精英优先策略已内置
+        cfg["local_rate"] = 1.0
         cfg["ls_max_steps"] = base_config["exploit_ls"]
         cfg["stagnation_limit"] = int(base_config["stagnation_limit"] * 0.8)
         
-    else:  # Explorer (多样性发生器)
+    else:  # Scout (快速侦察兵)
         cfg["k_tournament"] = 2
-        cfg["mutation_rate"] = base_config["explore_mut"]
-        cfg["local_rate"] = 0.6
-        cfg["ls_max_steps"] = base_config["explore_ls"]  # 轻量 LS，实际在 optimize 中固定为 5 步
-        cfg["stagnation_limit"] = int(base_config["stagnation_limit"] * 1.5)
+        # Scout 使用固定小种群 (e.g. 100) 以便快速迭代
+        cfg["lam"] = 100
+        cfg["mu"] = 100
+        cfg["mutation_rate"] = 0.5 # Moderate mutation
+        cfg["local_rate"] = 1.0    # 必须强 LS 才能产出高质量解
+        cfg["ls_max_steps"] = 50   # Deep Search
+        cfg["stagnation_limit"] = 50 # 频繁重启 (每 50 代无进展即重置)
         
     return cfg
 
@@ -151,8 +157,8 @@ def run_single_problem(target_csv, enable_log=True, log_folder="."):
     print(f"Config 1 (Explorer):  lam={cfg1['lam']}, mut={cfg1['mutation_rate']}, ls={cfg1['ls_max_steps']}")
 
     # Create communication queues
-    q1 = multiprocessing.Queue(maxsize=10)
-    q2 = multiprocessing.Queue(maxsize=10)
+    q1 = multiprocessing.Queue(maxsize=50)
+    q2 = multiprocessing.Queue(maxsize=50)
     
     # 诊断日志文件路径 (存入时间戳文件夹)
     if enable_log:
@@ -163,15 +169,19 @@ def run_single_problem(target_csv, enable_log=True, log_folder="."):
         log_0 = None
         log_1 = None
     
+    # 修改进程创建 
+    mig_q1 = q1 if ENABLE_MIGRATION else None
+    mig_q2 = q2 if ENABLE_MIGRATION else None
+
     # Define processes
     p1 = multiprocessing.Process(
         target=island_worker,
-        args=(0, cfg0, target_csv, q1, q2, log_0) 
+        args=(0, cfg0, target_csv, mig_q1, mig_q2, log_0) 
     )
     
     p2 = multiprocessing.Process(
         target=island_worker,
-        args=(1, cfg1, target_csv, q2, q1, log_1) 
+        args=(1, cfg1, target_csv, mig_q2, mig_q1, log_1) 
     )
 
     try:
@@ -199,11 +209,12 @@ def main():
         "tour500.csv",
         "tour750.csv",
         "tour1000.csv",
+        # "tour50.csv",
+        # "tour250.csv",
     ]
     
     # 是否启用诊断日志
     ENABLE_DIAGNOSTIC_LOG = True
-    
     # ==============================================================================
     
     # 创建时间戳文件夹存放日志
@@ -278,7 +289,7 @@ def main():
         
         # 等待所有进程完成 (带超时)
         for p in all_processes:
-            p.join(timeout=330)  # 5.5 分钟超时
+            p.join(timeout=310)  # 5.5 分钟超时
             if p.is_alive():
                 print(f"[Warning] Process {p.name} still alive, terminating...")
                 p.terminate()
