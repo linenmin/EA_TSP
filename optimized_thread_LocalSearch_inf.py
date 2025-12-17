@@ -1137,7 +1137,7 @@ class r0123456:
                     dlb_mask[:] = False 
                     received_count += 1
                     migration_event = 1
-                    if received_count % 10 == 0:
+                    if received_count % 50 == 0:
                          print(f"[Scout LNS] Received Patient #{received_count}. Fit: {p_fit:.2f}")
                 except:
                     pass
@@ -1186,10 +1186,10 @@ class r0123456:
             else:
                 pass
 
-            if log_h:
+            if log_h and (iter_count % 500 == 0 or migration_event or repulsion_event):
                 row = f"{iter_count},{best_fit:.4f},{current_fit:.4f},0,0,0,{migration_event},{repulsion_event},0\n"
                 log_h.write(row)
-                if iter_count % 100 == 0: log_h.flush()
+                if iter_count % 5000 == 0: log_h.flush()
 
             # Time Check (Interval)
             if iter_count % 100 == 0:
