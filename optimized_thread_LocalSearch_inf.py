@@ -807,12 +807,13 @@ def _double_bridge_jit(tour):
     tour[:] = new_tour[:]
 
 
+@njit(cache=True, parallel=True)
 def init_population_jit(pop, D, finite_mask, knn_idx, strat_probs, seeds, rcl_r):
     """
     并行生成初始种群，混合多种构造策略。
+    使用 prange 实现真正的并行初始化。
     """
     lam, n = pop.shape
-    step = max(1, lam // 10)
     
     for i in prange(lam):
         np.random.seed(seeds[i])  # 设置线程局部随机种子
@@ -834,10 +835,6 @@ def init_population_jit(pop, D, finite_mask, knn_idx, strat_probs, seeds, rcl_r)
                 tour = _rcl_nn_tour_jit(D, finite_mask, knn_idx, rcl_r)
                 
         pop[i] = tour
-        if i % step == 0:
-            # 注意：在JIT并发中 print 可能无序，仅作基本进度提示
-            # print("[init] generated", i, "/", lam) 
-            pass
 
 
 # ==============================================================================
@@ -1148,20 +1145,23 @@ class r0123456:
                 self.best_ever_fitness = bestObjective
                 self.stagnation_counter = 0
                 
-                # New Best! Print immediately
+                # New Best! 计算多样性并打印
                 div_dist, div_ent = calc_diversity_metrics_jit(population, population[best_idx])
                 print(f"Gen {gen:4d} | Best: {bestObjective:.2f} | Div: {div_dist:.1f} | Ent: {div_ent:.3f} (NEW BEST)")
+                _diversity_computed = True  # 标记已计算
                 
                 # 注：旧的 Explorer 注射逻辑已移除
                 # 现在 Explorer 每 50 代定期发送，使用分层筛选策略
                 
             else:
                 self.stagnation_counter += 1
+                _diversity_computed = False
                 
                 # 定期日志 (每 50 代)
                 if gen % 50 == 0:
                     div_dist, div_ent = calc_diversity_metrics_jit(population, population[best_idx])
                     print(f"Gen {gen:4d} | Best: {bestObjective:.2f} | Div: {div_dist:.1f} | Ent: {div_ent:.3f}")
+                    _diversity_computed = True
             
             # --- Call Reporter (Time Check & CSV Log) ---
             # 必须每代调用，以检查时间并记录 CSV
@@ -1169,9 +1169,10 @@ class r0123456:
             
             # --- 诊断日志: 写入 CSV 行 ---
             if self._log_handle:
-                # 需要计算 diversity 指标 (如果还没计算过)
-                if 'div_dist' not in dir() or gen % 50 != 0:
-                    div_dist, div_ent = calc_diversity_metrics_jit(population, population[best_idx])
+                # 只有在需要时才计算多样性 (每 50 代或 new best 时已算过)
+                if not _diversity_computed:
+                    # 非关键代只用 0 填充，避免昂贵的 entropy 计算
+                    div_dist, div_ent = 0.0, 0.0
                 row = f"{gen},{bestObjective:.4f},{meanObjective:.4f},{div_dist:.2f},{div_ent:.4f},{self.stagnation_counter},{int(_migration_this_gen)},{int(_repulsion_this_gen)},{_rtr_accepts}\n"
                 self._log_handle.write(row)
                 if gen % 50 == 0:  # 每 50 代 flush 一次
