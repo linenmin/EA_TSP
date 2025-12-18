@@ -900,8 +900,51 @@ def rtr_challenge_jit(child, child_fit, pop, fit, W, rng_seed, best_idx):
     return better, target_idx
 
 
+@njit(cache=True, fastmath=True)
+def _bfs_ruin_mask_jit(n, knn_idx, n_remove):
+    """
+    基于 BFS-KNN 的拓扑径向破坏掩码生成 (Topological Radial Ruin).
+    """
+    removed_mask = np.zeros(n, dtype=np.bool_)
+    if n_remove >= n:
+        removed_mask[:] = True
+        return removed_mask
+        
+    count = 0
+    center = np.random.randint(0, n)
+    
+    # Queue for BFS
+    queue = np.empty(n_remove + 100, dtype=np.int32)
+    q_head = 0
+    q_tail = 0
+    
+    queue[q_tail] = center; q_tail += 1
+    removed_mask[center] = True
+    count += 1
+    
+    K = knn_idx.shape[1]
+    
+    while count < n_remove and q_head < q_tail:
+        curr = queue[q_head]; q_head += 1
+        
+        for i in range(K):
+            neighbor = knn_idx[curr, i]
+            if neighbor == -1: break
+            
+            if not removed_mask[neighbor]:
+                removed_mask[neighbor] = True
+                count += 1
+                if q_tail < queue.size:
+                    queue[q_tail] = neighbor
+                    q_tail += 1
+                if count >= n_remove:
+                    break
+                    
+    return removed_mask
+
+
 @njit(cache=True, nogil=True)
-def _ruin_and_recreate_jit(tour: np.ndarray, D: np.ndarray, ruin_pct: float) -> np.ndarray:
+def _ruin_and_recreate_jit(tour: np.ndarray, D: np.ndarray, ruin_pct: float, knn_idx: np.ndarray = None) -> np.ndarray:
     """
     Ruin & Recreate (LNS Operator) - ATSP Optimized
     1. Ruin: 随机移除一段连续路径 (Segment Removal)
@@ -912,31 +955,42 @@ def _ruin_and_recreate_jit(tour: np.ndarray, D: np.ndarray, ruin_pct: float) -> 
     if n_remove < 2: 
         return tour.copy()
     
-    # --- 1. Ruin: Remove Segment ---
-    # 随机选择起始点
-    start_idx = np.random.randint(0, n)
-    
-    # 提取被移除的城市 (注意处理循环边界)
-    removed_cities = np.empty(n_remove, dtype=np.int32)
+    # Used for reconstruction
     kept_cities = np.empty(n - n_remove, dtype=np.int32)
+    removed_cities = np.empty(n_remove, dtype=np.int32)
     
-    r_ptr = 0
-    k_ptr = 0
-    
-    # 简单的循环遍历来分离城市
-    end_idx = (start_idx + n_remove) % n
-    
-    if start_idx < end_idx:
-        # 移除的是中间一段 [start, end)
-        kept_cities[:start_idx] = tour[:start_idx]
-        kept_cities[start_idx:] = tour[end_idx:]
-        removed_cities[:] = tour[start_idx:end_idx]
+    # --- Strategy Selection: Radial (if knn provided) vs Random Segment ---
+    if knn_idx is not None:
+        # P1: Topological Radial Ruin (BFS-KNN)
+        mask = _bfs_ruin_mask_jit(n, knn_idx, n_remove)
+        
+        # Split tour based on mask
+        k_ptr = 0
+        r_ptr = 0
+        for i in range(n):
+            c = tour[i]
+            if mask[c]:
+                if r_ptr < n_remove:
+                    removed_cities[r_ptr] = c
+                    r_ptr += 1
+            else:
+                if k_ptr < n - n_remove:
+                    kept_cities[k_ptr] = c
+                    k_ptr += 1
     else:
-        # 移除的是跨越边界的一段
-        kept_cities[:] = tour[end_idx:start_idx]
-        k = n - start_idx
-        removed_cities[:k] = tour[start_idx:]
-        removed_cities[k:] = tour[:end_idx]
+        # P0: Random Segment Ruin (Legacy)
+        start_idx = np.random.randint(0, n)
+        end_idx = (start_idx + n_remove) % n
+        
+        if start_idx < end_idx:
+            kept_cities[:start_idx] = tour[:start_idx]
+            kept_cities[start_idx:] = tour[end_idx:]
+            removed_cities[:] = tour[start_idx:end_idx]
+        else:
+            kept_cities[:] = tour[end_idx:start_idx]
+            k = n - start_idx
+            removed_cities[:k] = tour[start_idx:]
+            removed_cities[k:] = tour[:end_idx]
 
     # --- 2. Recreate: Cheapest Insertion ---
     current_tour = kept_cities
@@ -1111,10 +1165,14 @@ class r0123456:
         accepted_count = 0
         received_count = 0
         sent_count = 0
-        patient_entry_fit = float('inf')
         
-        # Adaptive LNS Gears
-        ruin_gears = np.array([0.15, 0.20, 0.25, 0.30, 0.40, 0.50])
+        # State logic for Trojan Horse
+        patient_entry_fit = float('inf')
+        scout_stagnation = 0 # Local stagnation counter for Scout
+        best_known_bound = float('inf') # The ceiling (usually patient_entry_fit)
+        
+        # Adaptive LNS Gears (Shifted Lower for better recovery)
+        ruin_gears = np.array([0.10, 0.15, 0.20, 0.25, 0.30, 0.40])
         last_improv_iter = 0
         last_send_iter = 0
         
@@ -1160,16 +1218,19 @@ class r0123456:
                         best_fit = p_fit
                     
                     if received_count % 50 == 0:
-                         print(f"[Scout LNS] Received Patient #{received_count} (Latest). Fit: {p_fit:.2f}")
+                         print(f"[Scout LNS] Received Patient #{received_count}. Fit: {p_fit:.2f}")
 
-                    last_improv_iter = iter_count # Reset gear on new patient
+                    last_improv_iter = iter_count 
+                    scout_stagnation = 0 # Reset stagnation on new patient
+                    best_known_bound = patient_entry_fit # Reset interaction bound
 
             # --- B. Ruin & Recreate (Kick) ---
-            # Adaptive Ruin Rate (Gears 0.15 -> 0.50)
+            # Adaptive Ruin Rate (Gears)
             gear_idx = int((iter_count - last_improv_iter) // 250) % 6
             ruin_pct = ruin_gears[gear_idx]
             
-            candidate = _ruin_and_recreate_jit(current_tour, D, ruin_pct)
+            # Use BFS-KNN Radial Ruin
+            candidate = _ruin_and_recreate_jit(current_tour, D, ruin_pct, knn_idx)
             
             # Reset DLB for candidate (major structural change)
             dlb_mask[:] = False 
@@ -1179,62 +1240,74 @@ class r0123456:
             _candidate_or_opt_jit(candidate, D, knn_idx, max_iters=500, dlb_mask=dlb_mask)
             cand_fit = tour_length_jit(candidate, D)
             
-            # --- D. Acceptance & Update ---
-            # 1. Global Best Update (Miracle Recovery)
-            if cand_fit < self.best_ever_fitness:
-                # Update Local Best
-                self.best_ever_fitness = cand_fit
-                best_tour[:] = candidate[:]
-                best_fit = cand_fit
-                
-                # Report
-                solution_to_report = self._rotate_to_start(best_tour, 0)
-                timeLeft = self.reporter.report(best_fit, best_fit, solution_to_report)
-                if timeLeft < 0: break
-                
-                # Send back to Exploiter immediately
-                if mig_queue is not None:
-                    try:
-                        mig_queue.put(best_tour.copy(), block=False)
-                        sent_count += 1
-                        repulsion_event = 1
-                        print(f"[Scout LNS] MIRACLE! Sent healed solution {best_fit:.2f} to Exploiter!")
-                    except:
-                        pass
+            # --- D. Acceptance & Trojan Discharge ---
+            scout_stagnation += 1
             
-            # 1.5 Healed Discharge (Good Improvement or Diversity)
-            # Send back if solution is as good as patient (or better), acting as diversity injection
-            # Threshold: Equal is fine (structural diff), or strict improvement
+            # 1. Dynamic Tolerance Calculation (Desperation Curve)
+            tolerance = 0.0
+            if scout_stagnation > 50: tolerance = 0.02 # 2%
+            if scout_stagnation > 200: tolerance = 0.05 # 5%
+            
+            # 2. Check for Global Breakthrough or Pilgrim/Trojan
+            # We compare against 'patient_entry_fit' (the standard set by Exploiter)
+            # Or 'best_known_bound' which tracks the best thing this Scout has seen/produced
+            
+            if cand_fit < best_known_bound:
+                 best_known_bound = cand_fit # Update local ceiling
+            
+            gap = (cand_fit - patient_entry_fit) / patient_entry_fit
+            
+            is_breakthrough = cand_fit < patient_entry_fit
+            is_trojan = (gap <= tolerance) and (gap > -1.0) # Within tolerance
+            
+            # 3. Discharge Logic
             if mig_queue is not None:
-                # We throttle to avoid flooding Exploiter with identical copies
-                # Send if improved OR (Equal/Close and enough time passed)
-                is_improved = cand_fit < patient_entry_fit
-                is_close_and_time = (cand_fit <= patient_entry_fit) and (iter_count - last_send_iter > 200)
+                should_discharge = False
                 
-                if is_improved or is_close_and_time:
+                # Condition A: Strict Improvement (Breakthrough)
+                if is_breakthrough:
+                    should_discharge = True
+                    # print(f"[Scout] BREAKTHROUGH! {cand_fit:.2f} < {patient_entry_fit:.2f}")
+                    
+                # Condition B: Trojan (Relaxed) - with throttle
+                elif is_trojan:
+                    if (iter_count - last_send_iter > 200):
+                        should_discharge = True
+                        # print(f"[Scout] TROJAN SENT. {cand_fit:.2f} (Tol {tolerance*100:.0f}%)")
+                
+                if should_discharge:
                     try:
                         mig_queue.put(candidate.copy(), block=False)
                         sent_count += 1
                         repulsion_event = 1
                         last_send_iter = iter_count
                         
-                        if is_improved:
-                            patient_entry_fit = cand_fit # Reset threshold if we strictly improved
-                            # print(f"[Scout LNS] Discharged IMPROVED patient {cand_fit:.2f}")
-                        # else:
-                        #     print(f"[Scout LNS] Discharged DIVERSITY patient {cand_fit:.2f}")
+                        if is_breakthrough:
+                            # CRITICAL: Only reset stagnation/gears on REAL breakthrough
+                            patient_entry_fit = cand_fit 
+                            scout_stagnation = 0 
+                            last_improv_iter = iter_count 
+                            # If it's a breakthrough, we have a new best.
+                            if cand_fit < self.best_ever_fitness:
+                                self.best_ever_fitness = cand_fit
+                                best_tour[:] = candidate[:]
+                                best_fit = cand_fit
+                                solution_to_report = self._rotate_to_start(candidate, 0)
+                                self.reporter.report(cand_fit, cand_fit, solution_to_report)
+                                print(f"[Scout LNS] *** NEW GLOBAL BEST {cand_fit:.2f} ***")
+
                     except:
                         pass
             
-            # 2. Local Acceptance (Current Solution Update)
-            # Accept if better or equal (Side-step allowed)
+            # 4. Local Acceptance (Hill Climbing / Annealing-like)
+            # Always accept improvement to current curve
             if cand_fit <= current_fit:
-                if cand_fit < current_fit:
-                    last_improv_iter = iter_count # Reset gear
                 current_tour[:] = candidate[:]
                 current_fit = cand_fit
                 accepted_count += 1
             else:
+                # Optional: slight SA or Threshold Accepting?
+                # For now simplify: Strict Hill Climbing locally (relying on Ruin to escape)
                 pass
 
             if log_h and (iter_count % 500 == 0 or migration_event or repulsion_event):

@@ -162,3 +162,28 @@
 
 此架构实现了 **异构搜索 (Heterogeneous Search)**，结合了 GA 的群体挖掘能力和 ILS 的单点突破能力。
 ---
+
+## 8. Trauma Center 优化日志 (Refinements 2025-12-18)
+
+针对 Trauam Center 初期的 "滞后 (Lag)" 和 "多样性丧失 (Starvation)" 问题，进行了以下关键升级：
+
+### 8.1 实时分诊 (Real-Time Triage)
+- **问题**: Scout 之前按顺序处理 "挂号队列"，导致在 Exploiter 快速进化时，Scout 还在处理过时的旧解 (Lag)。
+- **解决方案**: **Queue Flushing**。Scout 每次只从队列中取出**最新**的一个病人，丢弃所有积压的旧病人。确保 Scout 永远工作在 Exploiter 的最前沿。
+- **状态同步**: 一旦收到更优病人，立即更新 Scout 内部的 `Best Record`，消除视觉上的性能Gap。
+
+### 8.2 自适应手术 (Adaptive Ruin Gears)
+- **问题**: 固定的 20% Ruin Rate 在后期难以逃离 Exploiter 已陷入的深层局部最优。
+- **解决方案**: **Gear Shifting (换挡机制)**。
+    - 根据停滞时间动态调整破坏强度。
+    - **档位**: `[15%, 20%, 25%, 30%, 40%, 50%]`.
+    - **逻辑**: 初始精密手术 (15%) -> 若无效则加大剂量 -> 最高截肢 (50%) -> 一旦好转立即重置回 15%。
+
+### 8.3 多样性回流 (Diversity Injection)
+- **问题**: 早期版本只允许 "更好 (Strict Improvement)" 的解出院，导致 Scout 经常沉默，Exploiter 缺乏外部基因流入。
+- **解决方案**: **Relaxed Discharge**.
+    - 允许 **相近 (Equal)** 或 **更优 (Better)** 的解出院。
+    - **节流阀 (Throttle)**: 对 "Equal" 解施加冷却时间 (200 iters)，防止刷屏。
+    - **效果**: 持续向 Exploiter 输送结构不同但质量相当的 "康复变体"，有效维持了种群多样性。
+
+---
