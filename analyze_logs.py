@@ -18,23 +18,38 @@ def load_logs(island_0_log, island_1_log):
 
 def plot_convergence(df0, df1, output_file='convergence.png'):
     """绘制收敛曲线对比图"""
-    fig, ax = plt.subplots(figsize=(12, 6))
+    fig, ax1 = plt.subplots(figsize=(12, 6))
+    ax2 = ax1.twiny()
     
-    ax.plot(df0['gen'], df0['best_fit'], label='Island 0 (Exploiter)', alpha=0.8, linewidth=1)
-    ax.plot(df1['gen'], df1['best_fit'], label='Island 1 (Scout)', alpha=0.8, linewidth=1)
+    # Exploiter on Primary X (Bottom)
+    l1, = ax1.plot(df0['gen'], df0['best_fit'], label='Island 0 (Exploiter)', color='blue', alpha=0.8, linewidth=1.5)
+    
+    # Scout on Secondary X (Top)
+    l2, = ax2.plot(df1['gen'], df1['best_fit'], label='Island 1 (Trauma Center)', color='green', alpha=0.5, linewidth=1, linestyle='--')
     
     # 标记最终最佳
     best0 = df0['best_fit'].min()
     best1 = df1['best_fit'].min()
     overall_best = min(best0, best1)
     
-    ax.axhline(y=overall_best, color='r', linestyle='--', label=f'Overall Best: {overall_best:.2f}', alpha=0.7)
+    l3 = ax1.axhline(y=overall_best, color='r', linestyle=':', label=f'Overall Best: {overall_best:.2f}', alpha=0.7)
     
-    ax.set_xlabel('Generation')
-    ax.set_ylabel('Best Fitness')
-    ax.set_title('Convergence Comparison: Exploiter vs Scout')
-    ax.legend()
-    ax.grid(True, alpha=0.3)
+    ax1.set_xlabel('Exploiter Generation')
+    ax2.set_xlabel('Scout Iteration (LNS Steps)')
+    ax1.set_ylabel('Best Fitness')
+    ax1.set_title('Convergence Comparison: Exploiter vs Scout (Dual X-Axis)')
+    
+    # Combined Legend
+    lines = [l1, l2, l3]
+    labels = [l.get_label() for l in lines]
+    ax1.legend(lines, labels, loc='upper right')
+    
+    # Focus on stable part (zoom in Y-axis)
+    # Filter out the initial high values by setting max Y to 30% above best
+    y_limit = overall_best * 1.05
+    ax1.set_ylim(bottom=overall_best * 0.9999, top=y_limit)
+    
+    ax1.grid(True, alpha=0.3)
     
     plt.tight_layout()
     plt.savefig(output_file, dpi=150)
@@ -42,24 +57,44 @@ def plot_convergence(df0, df1, output_file='convergence.png'):
     return fig
 
 def plot_diversity(df0, df1, output_file='diversity.png'):
-    """绘制多样性变化图"""
-    fig, axes = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
+    """绘制多样性变化图 (Dual X-Axis)"""
+    fig, axes = plt.subplots(2, 1, figsize=(12, 8), sharex=False)
     
-    # Bond Distance
-    axes[0].plot(df0['gen'], df0['diversity'], label='Island 0 (Exploiter)', alpha=0.7)
-    axes[0].plot(df1['gen'], df1['diversity'], label='Island 1 (Scout)', alpha=0.7)
-    axes[0].set_ylabel('Avg Bond Distance')
-    axes[0].set_title('Diversity Metrics Over Time')
-    axes[0].legend()
-    axes[0].grid(True, alpha=0.3)
+    # --- Subplot 1: Bond Distance ---
+    ax1 = axes[0]
+    ax1b = ax1.twiny()
     
-    # Edge Entropy
-    axes[1].plot(df0['gen'], df0['entropy'], label='Island 0 (Exploiter)', alpha=0.7)
-    axes[1].plot(df1['gen'], df1['entropy'], label='Island 1 (Scout)', alpha=0.7)
-    axes[1].set_ylabel('Edge Entropy')
-    axes[1].set_xlabel('Generation')
-    axes[1].legend()
-    axes[1].grid(True, alpha=0.3)
+    # Exploiter
+    l1, = ax1.plot(df0['gen'], df0['diversity'], label='Exploiter Bond Dist', color='blue', alpha=0.7)
+    # Scout
+    l2, = ax1b.plot(df1['gen'], df1['diversity'], label='Scout Bond Dist', color='green', alpha=0.5, linestyle='--')
+    
+    ax1.set_ylabel('Avg Bond Distance')
+    ax1.set_xlabel('Exploiter Gen')
+    ax1b.set_xlabel('Scout Iter')
+    ax1.set_title('Diversity Metrics (Bond Distance)')
+    
+    # Legend
+    lines = [l1, l2]
+    ax1.legend(lines, [l.get_label() for l in lines], loc='upper right')
+    ax1.grid(True, alpha=0.3)
+    
+    # --- Subplot 2: Edge Entropy ---
+    ax2 = axes[1]
+    ax2b = ax2.twiny()
+    
+    # Exploiter
+    l3, = ax2.plot(df0['gen'], df0['entropy'], label='Exploiter Entropy', color='purple', alpha=0.7)
+    # Scout
+    l4, = ax2b.plot(df1['gen'], df1['entropy'], label='Scout Entropy', color='orange', alpha=0.5, linestyle='--')
+    
+    ax2.set_ylabel('Edge Entropy')
+    ax2.set_xlabel('Exploiter Gen')
+    ax2b.set_xlabel('Scout Iter')
+    
+    lines2 = [l3, l4]
+    ax2.legend(lines2, [l.get_label() for l in lines2], loc='upper right')
+    ax2.grid(True, alpha=0.3)
     
     plt.tight_layout()
     plt.savefig(output_file, dpi=150)
@@ -67,65 +102,77 @@ def plot_diversity(df0, df1, output_file='diversity.png'):
     return fig
 
 def plot_events(df0, df1, output_file='events.png'):
-    """绘制事件时间线 (RTR接受率 + 迁移事件)
+    """绘制事件时间线 (RTR接受率 + 迁移事件) - Independent X Axes"""
+    fig, axes = plt.subplots(3, 1, figsize=(12, 12), sharex=False)
     
-    新设计:
-    - 子图1: RTR 接受率
-    - 子图2: Scout 发送次数统计 (基于重启事件 -> Scout Strategy)
-    - 子图3: Exploiter 接收成功次数 (migration=1)
-    """
-    fig, axes = plt.subplots(3, 1, figsize=(12, 10), sharex=True)
+    # === Subplot 1: RTR Accept Rate (Dual Scale) ===
+    ax1 = axes[0]
+    ax1b = ax1.twiny()
     
-    # === RTR Accept Rate (滚动窗口) ===
     window = 50
     df0['rtr_rate'] = df0['rtr_accepts'].rolling(window).mean()
     df1['rtr_rate'] = df1['rtr_accepts'].rolling(window).mean()
     
-    axes[0].plot(df0['gen'], df0['rtr_rate'], label='Exploiter (Accepting Scout Seeds)', alpha=0.7, color='blue')
-    axes[0].plot(df1['gen'], df1['rtr_rate'], label='Scout (Internal Evolution)', alpha=0.7, color='green')
-    axes[0].set_ylabel(f'RTR Accepts (rolling {window})')
-    axes[0].set_title('Selection Pressure & Migration Events')
-    axes[0].legend()
-    axes[0].grid(True, alpha=0.3)
+    # Exploiter
+    l1, = ax1.plot(df0['gen'], df0['rtr_rate'], label='Exploiter RTR Rate', alpha=0.7, color='blue')
+    # Scout
+    l2, = ax1b.plot(df1['gen'], df1['rtr_rate'], label='Scout RTR Rate', alpha=0.7, color='green', linestyle='--')
+    
+    ax1.set_ylabel(f'RTR Accepts (rolling {window})')
+    ax1.set_title('Selection Pressure (Exploiter vs Scout)')
+    ax1.set_xlabel('Exploiter Gen')
+    ax1b.set_xlabel('Scout Iter')
+    
+    lines = [l1, l2]
+    ax1.legend(lines, [l.get_label() for l in lines], loc='upper right')
+    ax1.grid(True, alpha=0.3)
     
     
-    # === Trauma Center Events ===
-    # Exploiter Admissions (Patient Sent) - Assuming tracked via Repulsion or inferred
-    # Scout Admissions (Patient Received): df1['migration'] == 1
-    # Scout Discharges (Healed Sent): df1['repulsion'] == 1
+    # === Subplot 2: Trauma Center Activity (Scout Scale) ===
+    # Scout Admissions (Recv) & Discharges (Sent)
+    # Uses df1 (Scout Scale)
+    ax2 = axes[1]
     
-    # Plot Scout Admissions (Patients Received)
     admissions = df1[df1['migration'] == 1]
     if not admissions.empty:
-        axes[1].scatter(admissions['gen'], [1]*len(admissions), 
-                       marker='v', s=80, c='red', label=f'Trauma Center Admission ({len(admissions)})')
+        ax2.scatter(admissions['gen'], [1]*len(admissions), 
+                       marker='v', s=80, c='red', label=f'Trauma Admission (In) ({len(admissions)})')
     
-    # Plot Scout Discharges (Healed Sent)
     discharges = df1[df1['repulsion'] == 1]
     if not discharges.empty:
-        axes[1].scatter(discharges['gen'], [1]*len(discharges), 
+        ax2.scatter(discharges['gen'], [1]*len(discharges), 
                        marker='^', s=100, c='green', edgecolors='black', 
-                       linewidths=2, label=f'Trauma Center Discharge ({len(discharges)})')
+                       linewidths=2, label=f'Trauma Discharge (Out) ({len(discharges)})')
                        
-    axes[1].set_ylabel('Events')
-    axes[1].set_title('Trauma Center Activity (Red=In, Green=Out)')
-    axes[1].set_yticks([])
-    axes[1].legend()
-    axes[1].grid(True, alpha=0.3)
+    ax2.set_ylabel('Events')
+    ax2.set_xlabel('Scout Iteration (LNS Steps)')
+    ax2.set_title('Trauma Center Activity (Red=In, Green=Out)')
+    ax2.set_yticks([])
+    ax2.legend()
+    ax2.grid(True, alpha=0.3)
     
-    # === Exploiter Reception ===
-    # Exploiter Received Healed (migration=1)
+    # === Subplot 3: Exploiter Reception (Exploiter Scale) ===
+    # Exploiter Received Healed
+    # Uses df0 (Exploiter Scale)
+    ax3 = axes[2]
+    
     healed = df0[df0['migration'] == 1]
     if not healed.empty:
-        axes[2].scatter(healed['gen'], healed['best_fit'], 
+        ax3.scatter(healed['gen'], healed['best_fit'], 
                        marker='*', s=150, c='gold', edgecolors='black', 
                        label=f'Exploiter Received Healed ({len(healed)})', zorder=10)
     
-    axes[2].plot(df0['gen'], df0['best_fit'], label='Exploiter Fitness', alpha=0.5, color='blue')
-    axes[2].set_ylabel('Fitness')
-    axes[2].set_title('Exploiter Reception & Fitness Impact')
-    axes[2].legend()
-    axes[2].grid(True, alpha=0.3)
+    ax3.plot(df0['gen'], df0['best_fit'], label='Exploiter Fitness', alpha=0.5, color='blue')
+    ax3.set_ylabel('Fitness')
+    ax3.set_xlabel('Exploiter Generation')
+    ax3.set_title('Exploiter Reception & Fitness Impact')
+    
+    # Zoom in Y-axis
+    min_fit = df0['best_fit'].min()
+    ax3.set_ylim(bottom=min_fit * 0.9999, top=min_fit * 1.05)
+    
+    ax3.legend()
+    ax3.grid(True, alpha=0.3)
 
     
 
@@ -136,22 +183,30 @@ def plot_events(df0, df1, output_file='events.png'):
     return fig
 
 def plot_stagnation(df0, df1, output_file='stagnation.png'):
-    """绘制停滞计数曲线"""
-    fig, ax = plt.subplots(figsize=(12, 5))
+    """绘制停滞计数曲线 (Dual X-Axis)"""
+    fig, ax1 = plt.subplots(figsize=(12, 5))
+    ax2 = ax1.twiny()
     
-    ax.plot(df0['gen'], df0['stagnation'], label='Island 0 (Exploiter)', alpha=0.7)
-    ax.plot(df1['gen'], df1['stagnation'], label='Island 1 (Scout)', alpha=0.7, color='green')
+    # Exploiter
+    l1, = ax1.plot(df0['gen'], df0['stagnation'], label='Exploiter Stagnation', alpha=0.8, color='blue')
     
-    ax.set_xlabel('Generation')
-    ax.set_ylabel('Stagnation Counter')
-    ax.set_title('Stagnation Counter (Sawtooth pattern expected for Scout)')
-    ax.legend()
-    ax.grid(True, alpha=0.3)
+    # Scout (Usually 0 for LNS)
+    l2, = ax2.plot(df1['gen'], df1['stagnation'], label='Scout Stagnation', alpha=0.6, color='green', linestyle='--')
+    
+    ax1.set_xlabel('Exploiter Generation')
+    ax2.set_xlabel('Scout Iteration')
+    ax1.set_ylabel('Stagnation Counter')
+    ax1.set_title('Stagnation Counter (Exploiter vs Scout)')
+    
+    lines = [l1, l2]
+    ax1.legend(lines, [l.get_label() for l in lines], loc='upper right')
+    ax1.grid(True, alpha=0.3)
     
     plt.tight_layout()
     plt.savefig(output_file, dpi=150)
     print(f"[Saved] {output_file}")
     return fig
+
 
 def print_summary(df0, df1):
     """打印摘要统计"""
@@ -185,7 +240,7 @@ def main():
     # 用户配置区域：只需要填入日志文件夹路径
     # ==============================================================================
     
-    LOG_FOLDER = "logs_20251217_225605"  # 填入日志文件夹名称
+    LOG_FOLDER = "logs_20251218_101252"  # 填入日志文件夹名称
     
     # ==============================================================================
     

@@ -1111,6 +1111,12 @@ class r0123456:
         accepted_count = 0
         received_count = 0
         sent_count = 0
+        patient_entry_fit = float('inf')
+        
+        # Adaptive LNS Gears
+        ruin_gears = np.array([0.15, 0.20, 0.25, 0.30, 0.40, 0.50])
+        last_improv_iter = 0
+        last_send_iter = 0
         
         print(f"[Scout LNS] Started. Initial Fit: {best_fit:.2f}")
         
@@ -1128,23 +1134,42 @@ class r0123456:
             repulsion_event = 0 # 1=Sent
             
             # --- A. Check Incoming Patients (from Exploiter) ---
+            # --- A. Check Incoming Patients (from Exploiter) ---
             if recv_queue is not None:
+                latest_patient = None
+                # Flush queue to process only the freshest patient
                 try:
-                    patient = recv_queue.get(block=False)
-                    p_fit = tour_length_jit(patient, D)
-                    current_tour[:] = patient[:]
-                    current_fit = p_fit
-                    dlb_mask[:] = False 
-                    received_count += 1
-                    migration_event = 1
-                    if received_count % 50 == 0:
-                         print(f"[Scout LNS] Received Patient #{received_count}. Fit: {p_fit:.2f}")
+                    while True:
+                        latest_patient = recv_queue.get(block=False)
+                        received_count += 1
+                        migration_event = 1
                 except:
                     pass
+                
+                if latest_patient is not None:
+                    p_fit = tour_length_jit(latest_patient, D)
+                    current_tour[:] = latest_patient[:]
+                    current_fit = p_fit
+                    dlb_mask[:] = False 
+                    patient_entry_fit = p_fit # Track for discharge
+                    
+                    # Sync Best: If patient is better than local best, update immediately
+                    if p_fit < self.best_ever_fitness:
+                        self.best_ever_fitness = p_fit
+                        best_tour[:] = latest_patient[:]
+                        best_fit = p_fit
+                    
+                    if received_count % 50 == 0:
+                         print(f"[Scout LNS] Received Patient #{received_count} (Latest). Fit: {p_fit:.2f}")
+
+                    last_improv_iter = iter_count # Reset gear on new patient
 
             # --- B. Ruin & Recreate (Kick) ---
-            # 20% Ruin Rate usually good for LNS
-            candidate = _ruin_and_recreate_jit(current_tour, D, 0.20)
+            # Adaptive Ruin Rate (Gears 0.15 -> 0.50)
+            gear_idx = int((iter_count - last_improv_iter) // 250) % 6
+            ruin_pct = ruin_gears[gear_idx]
+            
+            candidate = _ruin_and_recreate_jit(current_tour, D, ruin_pct)
             
             # Reset DLB for candidate (major structural change)
             dlb_mask[:] = False 
@@ -1177,9 +1202,35 @@ class r0123456:
                     except:
                         pass
             
+            # 1.5 Healed Discharge (Good Improvement or Diversity)
+            # Send back if solution is as good as patient (or better), acting as diversity injection
+            # Threshold: Equal is fine (structural diff), or strict improvement
+            if mig_queue is not None:
+                # We throttle to avoid flooding Exploiter with identical copies
+                # Send if improved OR (Equal/Close and enough time passed)
+                is_improved = cand_fit < patient_entry_fit
+                is_close_and_time = (cand_fit <= patient_entry_fit) and (iter_count - last_send_iter > 200)
+                
+                if is_improved or is_close_and_time:
+                    try:
+                        mig_queue.put(candidate.copy(), block=False)
+                        sent_count += 1
+                        repulsion_event = 1
+                        last_send_iter = iter_count
+                        
+                        if is_improved:
+                            patient_entry_fit = cand_fit # Reset threshold if we strictly improved
+                            # print(f"[Scout LNS] Discharged IMPROVED patient {cand_fit:.2f}")
+                        # else:
+                        #     print(f"[Scout LNS] Discharged DIVERSITY patient {cand_fit:.2f}")
+                    except:
+                        pass
+            
             # 2. Local Acceptance (Current Solution Update)
             # Accept if better or equal (Side-step allowed)
             if cand_fit <= current_fit:
+                if cand_fit < current_fit:
+                    last_improv_iter = iter_count # Reset gear
                 current_tour[:] = candidate[:]
                 current_fit = cand_fit
                 accepted_count += 1
