@@ -22,7 +22,7 @@ except ImportError:
     print("Error: Numba is required for this script. Please install it with: pip install numba")
     exit(1)
 
-# 设置 Numba 并行线程数（根据硬件调整，通常2-4个足够）
+# 设置 Numba 并行线程数（要求只能用两个CPU核心）
 # ⭐ 智能检测：如果环境变量已限制线程数，则遵循该限制
 _numba_threads_env = os.environ.get("NUMBA_NUM_THREADS", None)
 if _numba_threads_env is not None:
@@ -221,239 +221,384 @@ def _rand_perm_jit(n):
     return arr
 
 
+
+
+
+
+
+
+
 @njit(cache=True, fastmath=True)
-def _or_opt_once_jit(tour, D, block_size):
+def double_bridge_move(tour):
     """
-    尝试一次 Or-Opt (Block Shift) 移动。
-    移动一个长度为 block_size 的片段到新位置。
-    JIT 优化版。
+    执行一次 Double Bridge 扰动 (4-opt 变体)。
+    用于打破局部最优，常用于 Restart 或 Kick。
     """
     n = tour.shape[0]
+    if n < 8: return tour.copy()
     
-    # 随机化 block 起点
-    start_node = np.random.randint(0, n)
+    # 随机选择4个切点 A, B, C, D (p1, p2, p3, p4)
+    p1 = np.random.randint(1, n // 4)
+    p2 = np.random.randint(p1 + 1, n // 2)
+    p3 = np.random.randint(p2 + 1, 3 * n // 4)
     
-    for i_offset in range(n):
-        i = (start_node + i_offset) % n
+    # 构建新路径: 
+    # 原路: [0..p1] - [p1..p2] - [p2..p3] - [p3..n]
+    #      Block A    Block B    Block C    Block D
+    # 新路: Block A - Block C - Block B - Block D
+    
+    new_tour = np.empty(n, dtype=tour.dtype)
+    idx = 0
+    
+    # Block A
+    for i in range(0, p1):
+        new_tour[idx] = tour[i]; idx += 1
+    # Block C (Swapped)
+    for i in range(p2, p3):
+        new_tour[idx] = tour[i]; idx += 1
+    # Block B (Swapped)
+    for i in range(p1, p2):
+        new_tour[idx] = tour[i]; idx += 1
+    # Block D
+    for i in range(p3, n):
+        new_tour[idx] = tour[i]; idx += 1
         
-        # 只处理不跨越数组边界的 block (简化逻辑，对随机起点足够)
-        if i + block_size >= n: continue
-        
-        # 定义 block: [i ... i+BS-1]
-        # 原始连接: A(i-1) -> B(i) 和 C(i+BS-1) -> D(i+BS)
-        
-        prev_idx = i - 1
-        if prev_idx < 0: prev_idx = n - 1
-        
-        post_idx = i + block_size
-        if post_idx >= n: post_idx = 0
-        
-        A = tour[prev_idx]
-        B = tour[i]
-        C = tour[i + block_size - 1]
-        D_node = tour[post_idx] # D keyword conflict
-        
-        # 移除代价: -AB -CD +AD
-        if not (np.isfinite(D[A, B]) and np.isfinite(D[C, D_node]) and np.isfinite(D[A, D_node])):
-            continue
-            
-        remove_gain = D[A, B] + D[C, D_node] - D[A, D_node]
-        
-        # 扫描插入位置 j
-        # j 不能在 block 内部，也不能是 prev_idx
-        for j in range(n):
-            if j >= i - 1 and j < i + block_size:
-                continue
-                
-            # 插入到 j 和 j+1 之间
-            # X(j) -> Y(j+1)
-            # 变为: X -> B...C -> Y
-            
-            j_next = j + 1
-            if j_next >= n: j_next = 0
-            
-            X = tour[j]
-            Y = tour[j_next]
-            
-            if not (np.isfinite(D[X, Y]) and np.isfinite(D[X, B]) and np.isfinite(D[C, Y])):
-                continue
-                
-            # gain = remove_gain + XY - XB - CY
-            gain = remove_gain + D[X, Y] - D[X, B] - D[C, Y]
-            
-            if gain > 1e-6:
-                # 执行移动 (非 inplace，使用 buffer)
-                # 构造新 tour
-                new_tour = np.empty_like(tour)
-                idx = 0
-                
-                # 复制 0..j
-                # 注意 j 可能在 i 前或后，逻辑要通用
-                # 我们遍历原 tour 的所有非 block 元素
-                
-                # 优化: 手动 loop
-                for k in range(n):
-                    # 跳过 block
-                    if k >= i and k < i + block_size:
-                        continue
-                        
-                    new_tour[idx] = tour[k]
-                    idx += 1
-                    
-                    if k == j: # 在 j 后面插入 block
-                        # 插入 block
-                        for b_idx in range(i, i + block_size):
-                            new_tour[idx] = tour[b_idx]
-                            idx += 1
-                            
-                tour[:] = new_tour[:]
-                return True
-                
-    return False
-
-
-
-
+    return new_tour
 
 
 @njit(cache=True, fastmath=True)
 def _candidate_or_opt_jit(tour, D, knn_idx, max_iters=100, dlb_mask=None, block_size=1):
     """
-    P1: ??????? Or-Opt/Block-Or-Opt??? DLB ???
+    Candidate-List based Or-Opt (Block Shift) 局部搜索。
+    尝试将长度为 block_size 的片段移动到其邻域内的新位置。
     """
-    n = tour.shape[0]  # ???
-    K = knn_idx.shape[1]  # ???
-    block_size = int(block_size)  # ???
-    if block_size < 1:  # ????
-        block_size = 1  # ??
-    if block_size >= n:  # ????
-        return False  # ????
+    n = tour.shape[0]
+    K = knn_idx.shape[1]
+    block_size = int(block_size)
     
-    pos = np.empty(n, np.int32)  # ???
-    for i in range(n):  # ??
-        pos[tour[i]] = i  # ??
+    # 基础参数检查
+    if block_size < 1: block_size = 1
+    if block_size >= n: return False # 片段过长
     
-    improved = False  # ????
-    use_dlb = (dlb_mask is not None)  # DLB??
+    # 构建位置索引 pos[city] = index，用于快速查找
+    pos = np.empty(n, np.int32)
+    for i in range(n):
+        pos[tour[i]] = i
     
-    for _ in range(max_iters):  # ????
-        found_in_try = False  # ????
-        start = np.random.randint(0, n)  # ????
+    improved = False # 是否有改进
+    use_dlb = (dlb_mask is not None) # 是否启用 DLB
+    
+    # 尝试 max_iters 次随机起点的搜索
+    for _ in range(max_iters): 
+        found_in_try = False 
+        start = np.random.randint(0, n) # 随机选择当前起点
         
-        for offset in range(n):  # ????
-            u_idx = (start + offset) % n  # ????
-            u = tour[u_idx]  # ????
+        # 遍历所有节点作为 Block 的起始位置
+        for offset in range(n): 
+            u_idx = (start + offset) % n
+            u = tour[u_idx] # Block 头节点
             
-            if use_dlb and dlb_mask[u]:  # DLB??
-                continue  # ??
+            # DLB 剪枝：如果 u 没被标记，说明近期无改进，跳过
+            if use_dlb and dlb_mask[u]: 
+                continue 
                 
-            if block_size > 1 and u_idx + block_size >= n:  # ????
-                if use_dlb:  # DLB??
-                    dlb_mask[u] = True  # ????
-                continue  # ??
+            # 边界检查：Block 不能跨越数组尾部 (简化实现)
+            if block_size > 1 and u_idx + block_size >= n: 
+                if use_dlb: dlb_mask[u] = True
+                continue 
             
-            prev_idx = u_idx - 1  # ????
-            if prev_idx < 0:  # ????
-                prev_idx = n - 1  # ????
+            # 确定 Block 的边界和上下文
+            # 结构: prev -> [u ... tail] -> next
+            prev_idx = u_idx - 1 
+            if prev_idx < 0: prev_idx = n - 1
                 
-            post_idx = u_idx + block_size  # ????
-            if post_idx >= n:  # ????
-                post_idx = 0  # ????
+            post_idx = u_idx + block_size 
+            if post_idx >= n: post_idx = 0
             
-            prev_u = tour[prev_idx]  # ????
-            block_head = u  # ????
-            block_tail = tour[u_idx + block_size - 1]  # ????
-            next_after = tour[post_idx]  # ????
+            prev_u = tour[prev_idx] # 前驱节点
+            block_head = u 
+            block_tail = tour[u_idx + block_size - 1] # Block 尾节点
+            next_after = tour[post_idx] # 后继节点
             
-            if not np.isfinite(D[prev_u, block_head]):  # ???
-                continue  # ??
-            if not np.isfinite(D[block_tail, next_after]):  # ???
-                continue  # ??
-            if not np.isfinite(D[prev_u, next_after]):  # ???
-                continue  # ??
+            # 检查当前相关边的可行性 (距离是否有限)
+            if not np.isfinite(D[prev_u, block_head]): continue
+            if not np.isfinite(D[block_tail, next_after]): continue
+            if not np.isfinite(D[prev_u, next_after]): continue # 移除 Block 后 prev与next必须相连
             
-            remove_cost = D[prev_u, block_head] + D[block_tail, next_after]  # ????
-            new_edge_cost = D[prev_u, next_after]  # ?????
-            move_found = False  # ????
+            # 计算移除 Block 的成本变化
+            # Remove cost: 断开 (prev, head) 和 (tail, next)，连接 (prev, next)
+            # Gain = (D[prev, head] + D[tail, next]) - D[prev, next]
+            remove_cost = D[prev_u, block_head] + D[block_tail, next_after]
+            new_edge_cost = D[prev_u, next_after]
             
-            for k in range(K):  # ????
-                target = knn_idx[block_head, k]  # ????
-                if target == -1:  # ????
-                    break  # ??
+            move_found = False 
+            
+            # 遍历 Block 头节点 u 的 KNN 邻居，寻找插入位置
+            # 试图将 Block 插入到 target 之后： target -> [Block] -> target_next
+            for k in range(K): 
+                target = knn_idx[block_head, k] # 潜在的前驱节点 (Candidate Predecessor)
+                if target == -1: break 
                 
-                t_idx = pos[target]  # ????
-                if t_idx == prev_idx:  # ?????
-                    continue  # ??
-                if t_idx >= u_idx and t_idx < u_idx + block_size:  # ???
-                    continue  # ??
-                    
-                next_t = tour[(t_idx + 1) % n]  # ????
+                t_idx = pos[target] 
                 
-                if not np.isfinite(D[target, next_t]):  # ???
-                    continue  # ??
-                if not np.isfinite(D[target, block_head]):  # ???
-                    continue  # ??
-                if not np.isfinite(D[block_tail, next_t]):  # ???
-                    continue  # ??
+                # 位置合法性检查
+                if t_idx == prev_idx: continue # 原位，跳过
+                if t_idx >= u_idx and t_idx < u_idx + block_size: continue # 目标在 Block 内部，非法
+                    
+                target_next = tour[(t_idx + 1) % n] # 目标位置的后继
                 
-                insert_cost = D[target, block_head] + D[block_tail, next_t]  # ????
-                old_edge_cost = D[target, next_t]  # ????
-                gain = (remove_cost - new_edge_cost) + (old_edge_cost - insert_cost)  # ???
+                # 边可行性检查
+                if not np.isfinite(D[target, target_next]): continue
+                if not np.isfinite(D[target, block_head]): continue # 连入 Block 头
+                if not np.isfinite(D[block_tail, target_next]): continue # Block 尾连出
                 
-                if gain > 1e-6:  # ???
-                    block = np.empty(block_size, dtype=tour.dtype)  # ???
-                    for b in range(block_size):  # ???
-                        block[b] = tour[u_idx + b]  # ??
+                # 计算插入成本
+                # Insert cost: 断开 (target, next)，连接 (target, head) 和 (tail, next)
+                insert_cost = D[target, block_head] + D[block_tail, target_next]
+                old_edge_cost = D[target, target_next]
+                
+                # 总增益 = 移除增益 + 插入增益 - 插入成本
+                gain = (remove_cost - new_edge_cost) + (old_edge_cost - insert_cost)
+                
+                if gain > 1e-6: # 发现改进
+                    # === 执行移动 (Array Manipulation) ===
+                    # 1. 提取 Block
+                    block = np.empty(block_size, dtype=tour.dtype)
+                    for b in range(block_size): 
+                        block[b] = tour[u_idx + b]
                     
-                    temp_len = n - block_size  # ????
-                    temp_tour = np.empty(temp_len, dtype=tour.dtype)  # ????
-                    if u_idx > 0:  # ???
-                        temp_tour[:u_idx] = tour[:u_idx]  # ????
-                    if u_idx + block_size < n:  # ???
-                        temp_tour[u_idx:] = tour[u_idx + block_size:]  # ????
+                    # 2. 移除 Block，构建临时路径
+                    temp_len = n - block_size
+                    temp_tour = np.empty(temp_len, dtype=tour.dtype)
+                    # 复制前半段
+                    if u_idx > 0: 
+                        temp_tour[:u_idx] = tour[:u_idx]
+                    # 复制后半段
+                    if u_idx + block_size < n: 
+                        temp_tour[u_idx:] = tour[u_idx + block_size:]
                     
-                    t_idx_new = t_idx  # ???
-                    if t_idx > u_idx:  # ????
-                        t_idx_new -= block_size  # ????
+                    # 3. 确定新的插入位置索引
+                    # 如果 target 在 Block 之后，其索引需要前移 block_size
+                    t_idx_new = t_idx 
+                    if t_idx > u_idx: 
+                        t_idx_new -= block_size
                     
-                    new_tour = np.empty(n, dtype=tour.dtype)  # ???
-                    idx = 0  # ????
-                    for i in range(temp_len):  # ????
-                        new_tour[idx] = temp_tour[i]  # ????
-                        idx += 1  # ????
-                        if i == t_idx_new:  # ???
-                            for b in range(block_size):  # ???
-                                new_tour[idx] = block[b]  # ???
-                                idx += 1  # ????
+                    # 4. 在 t_idx_new 之后插入 Block
+                    new_tour = np.empty(n, dtype=tour.dtype)
+                    idx = 0
+                    for i in range(temp_len):
+                        new_tour[idx] = temp_tour[i]
+                        idx += 1
+                        if i == t_idx_new: # 插入点
+                            for b in range(block_size):
+                                new_tour[idx] = block[b]
+                                idx += 1
                     
-                    tour[:] = new_tour[:]  # ????
-                    for i in range(n):  # ????
-                        pos[tour[i]] = i  # ????
+                    # 5. 更新原数组和索引表
+                    tour[:] = new_tour[:]
+                    for i in range(n): 
+                        pos[tour[i]] = i
                     
-                    improved = True  # ????
-                    move_found = True  # ????
-                    found_in_try = True  # ????
+                    improved = True
+                    move_found = True
+                    found_in_try = True
                     
-                    if use_dlb:  # ??DLB
-                        dlb_mask[prev_u] = False  # ??
-                        dlb_mask[next_after] = False  # ??
-                        dlb_mask[target] = False  # ??
-                        dlb_mask[next_t] = False  # ????
-                        for b in range(block_size):  # ??
-                            dlb_mask[block[b]] = False  # ??
+                    # 6. 更新 DLB 状态 (激活相关节点)
+                    if use_dlb: 
+                        dlb_mask[prev_u] = False # 前驱变了
+                        dlb_mask[next_after] = False # 后继变了
+                        dlb_mask[target] = False # 插入点变了
+                        dlb_mask[target_next] = False
+                        for b in range(block_size): # Block 内部也激活
+                            dlb_mask[block[b]] = False
                     
-                    break  # ????
+                    break # 跳出 KNN 循环，重新寻找
             
-            if move_found:  # ????
-                continue  # ????
-            else:  # ???
-                if use_dlb:  # DLB??
-                    dlb_mask[block_head] = True  # ??
+            if move_found: 
+                continue # 移动成功，继续外层循环
+            else: 
+                # 未找到移动，且启用了 DLB，则标记 u 为 inactive
+                if use_dlb: 
+                    dlb_mask[block_head] = True
                     
-        if not found_in_try and use_dlb:  # ?????
-            break  # ??
+        # 如果一轮扫描下来没有任何改进，且启用了 DLB，可以提前退出
+        if not found_in_try and use_dlb: 
+            break
             
     return improved
+
+@njit(cache=True, fastmath=True)
+def _candidate_block_swap_jit(tour, D, knn_idx, max_iters=50, dlb_mask=None, block_size=2):
+    """
+    P1.5: KNN 限制的 Segment Swap / Block Exchange (不反转).
+    尝试交换两个不重叠的片段 (Block 1 和 Block 2).
+    对于 Asymmetric TSP 安全，因为不涉及反转.
+    """
+    n = tour.shape[0]
+    K = knn_idx.shape[1]
+    block_size = int(block_size)
+    max_iters = int(max_iters)
+    
+    # 基础参数检查
+    if block_size < 1: block_size = 1
+    if block_size * 2 >= n: return False # 两个 Block 不能覆盖全图
+    
+    # 构建位置索引
+    pos = np.empty(n, np.int32)
+    for i in range(n):
+        pos[tour[i]] = i
+    
+    improved = False
+    use_dlb = (dlb_mask is not None)
+    
+    for _ in range(max_iters):
+        found_in_try = False
+        start = np.random.randint(0, n)
+        
+        # 遍历 Block 1 的起始位置
+        for offset in range(n):
+            u_idx = (start + offset) % n # Block 1 起点索引
+            u = tour[u_idx] # Block 1 头节点
+            
+            if use_dlb and dlb_mask[u]: continue
+                
+            # Block 1 边界检查
+            if u_idx + block_size >= n: 
+                if use_dlb: dlb_mask[u] = True
+                continue
+            
+            # --- 定义 Block 1 上下文 ---
+            # a -> [b ... c] -> d
+            i = u_idx        # Block 1 start
+            a_idx = i - 1    # Predecessor
+            if a_idx < 0: a_idx = n - 1
+            d_idx = i + block_size # Successor
+            
+            a = tour[a_idx]
+            b = tour[i]
+            c = tour[i + block_size - 1]
+            d = tour[d_idx]
+            
+            # 边可行性预检
+            if not np.isfinite(D[a, b]): continue
+            if not np.isfinite(D[c, d]): continue
+            
+            move_found = False
+            
+            # --- 寻找 Block 2 (f) ---
+            # 策略: 在 a 的 KNN 中寻找 f，使得新边 (a, f) 可行且距离短
+            # 试图构建: a -> f ...
+            for k in range(K):
+                target = knn_idx[a, k] # Candidate f
+                if target == -1: break
+                
+                j = pos[target] # Block 2 start index
+                
+                # --- 合法性与去重检查 ---
+                # 1. 必须在 Block 1 后面 (避免与反向重复处理)
+                if j <= i: continue
+                # 2. 不能重叠 (Block 2 start 必须在 Block 1 end 之后)
+                if j < i + block_size: continue
+                # 3. Block 2 不能越界 (简化)
+                if j + block_size >= n: continue
+                
+                # --- 定义 Block 2 上下文 ---
+                # e -> [f ... g] -> h
+                e_idx = j - 1
+                e = tour[e_idx]
+                f = tour[j]           # target
+                g = tour[j + block_size - 1]
+                h = tour[j + block_size]
+                
+                # --- 情况 A: 两个 Block 紧邻 ---
+                # a -> [b...c] -> [f...g] -> h
+                # 此时 d == f, e == c
+                # 交换后: a -> [f...g] -> [b...c] -> h
+                if j == i + block_size:
+                    # 检查新边: (a, f), (g, b), (c, h)
+                    if not np.isfinite(D[a, f]): continue
+                    if not np.isfinite(D[g, b]): continue
+                    if not np.isfinite(D[c, h]): continue
+                    
+                    old_cost = D[a, b] + D[c, f] + D[g, h]
+                    new_cost = D[a, f] + D[g, b] + D[c, h]
+                    
+                # --- 情况 B: 两个 Block 分离 ---
+                # a -> [b...c] -> d ... e -> [f...g] -> h
+                # 交换后: a -> [f...g] -> d ... e -> [b...c] -> h
+                else:
+                    # 检查新边: (a, f), (g, d), (e, b), (c, h)
+                    if not np.isfinite(D[a, f]): continue
+                    if not np.isfinite(D[g, d]): continue
+                    if not np.isfinite(D[e, b]): continue
+                    if not np.isfinite(D[c, h]): continue
+                    
+                    old_cost = D[a, b] + D[c, d] + D[e, f] + D[g, h]
+                    new_cost = D[a, f] + D[g, d] + D[e, b] + D[c, h]
+                
+                gain = old_cost - new_cost
+                
+                if gain > 1e-6: # 发现改进
+                    # === 执行交换 (Array Manipulation) ===
+                    new_tour = np.empty_like(tour)
+                    idx = 0
+                    
+                    # 1. 前缀 [0 ... i-1]
+                    for t in range(0, i):
+                        new_tour[idx] = tour[t]
+                        idx += 1
+                    
+                    # 2. Block 2 [f ... g] (放入 Block 1 位置)
+                    for t in range(j, j + block_size):
+                        new_tour[idx] = tour[t]
+                        idx += 1
+                        
+                    # 3. 中间段 [d ... e] (如果有)
+                    for t in range(i + block_size, j):
+                        new_tour[idx] = tour[t]
+                        idx += 1
+                        
+                    # 4. Block 1 [b ... c] (放入 Block 2 位置)
+                    for t in range(i, i + block_size):
+                        new_tour[idx] = tour[t]
+                        idx += 1
+                        
+                    # 5. 后缀 [h ... n-1]
+                    for t in range(j + block_size, n):
+                        new_tour[idx] = tour[t]
+                        idx += 1
+                        
+                    # 更新
+                    tour[:] = new_tour[:]
+                    for t in range(n): pos[tour[t]] = t
+                    
+                    improved = True
+                    move_found = True
+                    found_in_try = True
+                    
+                    # 更新 DLB (所有涉及断开连接的点)
+                    if use_dlb:
+                        dlb_mask[a] = False
+                        dlb_mask[b] = False
+                        dlb_mask[c] = False
+                        dlb_mask[d] = False
+                        dlb_mask[e] = False
+                        dlb_mask[f] = False
+                        dlb_mask[g] = False
+                        dlb_mask[h] = False
+                    
+                    break # 退出 KNN 循环
+            
+            if move_found:
+                continue
+            else:
+                if use_dlb: dlb_mask[b] = True # 注意: DLB 标记的是 Block 1 的头节点 b
+                    
+        if not found_in_try and use_dlb:
+            break
+            
+    return improved
+
 @njit(cache=True, fastmath=True)
 def double_bridge_move(tour):
     """
@@ -1015,47 +1160,7 @@ def _ruin_and_recreate_jit(tour: np.ndarray, D: np.ndarray, ruin_pct: float, knn
     return current_tour
 
 
-@njit(cache=True, fastmath=True)
-def _double_bridge_jit(tour):
-    """
-    Double Bridge 扰动操作 (4-Opt 变体)。
-    将 tour 切成 4 段并重新拼接，产生 2-Opt 无法达到的结构变化。
-    这是 LKH 算法的核心组件之一。
-    """
-    n = tour.shape[0]
-    if n < 8:
-        return  # 城市太少，不适用
-    
-    # 随机选择 4 个切点 p1 < p2 < p3 < p4
-    # 确保每段至少有 1 个城市
-    p1 = np.random.randint(1, n // 4)
-    p2 = np.random.randint(p1 + 1, n // 2)
-    p3 = np.random.randint(p2 + 1, 3 * n // 4)
-    p4 = n  # 最后一个切点就是数组末尾
-    
-    # 原始 4 段: A=[0:p1], B=[p1:p2], C=[p2:p3], D=[p3:n]
-    # Double Bridge 重组: A + C + B + D (交换 B 和 C)
-    new_tour = np.empty(n, dtype=np.int32)
-    idx = 0
-    
-    # 段 A
-    for i in range(0, p1):
-        new_tour[idx] = tour[i]
-        idx += 1
-    # 段 C
-    for i in range(p2, p3):
-        new_tour[idx] = tour[i]
-        idx += 1
-    # 段 B
-    for i in range(p1, p2):
-        new_tour[idx] = tour[i]
-        idx += 1
-    # 段 D
-    for i in range(p3, n):
-        new_tour[idx] = tour[i]
-        idx += 1
-        
-    tour[:] = new_tour[:]
+
 
 
 @njit(cache=True, parallel=True)
@@ -1086,6 +1191,75 @@ def init_population_jit(pop, D, finite_mask, knn_idx, strat_probs, seeds, rcl_r)
                 tour = _rcl_nn_tour_jit(D, finite_mask, knn_idx, rcl_r)
                 
         pop[i] = tour
+
+
+@njit(cache=True, parallel=True)
+def _resync_population_jit(pop, fit, best_tour, D, seed, cutoff_ratio=0.3):
+    """
+    Population Resync V2: Controlled Chaos.
+    Replace worst `cutoff_ratio` portion with Mixed Strategy:
+    - Even indices: 1x Double Bridge (Pull to Peak)
+    - Odd indices:  4x Double Bridge (Inject Diversity/Chaos)
+    """
+    lam, n = pop.shape
+    cutoff = int(lam * cutoff_ratio) # Variable cutoff
+    
+    # 1. Identify worst indices (descending fitness)
+    order = np.argsort(fit)[::-1]
+    targets = order[:cutoff]
+    
+    # 2. Parallel Replacement
+    for i in prange(cutoff):
+        idx = targets[i]
+        np.random.seed(seed + idx) 
+        
+        # Clone Best
+        pop[idx] = best_tour[:]
+        
+        # Determine Mutation Intensity
+        # Even: Standard (1 DB)
+        # Odd:  Heavy (4 DBs) -> larger perturbation
+        num_kicks = 1 if (i % 2 == 0) else 4
+        
+        valid_kick = False
+        # Try to find a valid mutation sequence
+        for attempt in range(10): 
+            # Create a localized temp tour for this attempt
+            temp_tour = pop[idx].copy()
+            
+            # Apply Kicks
+            possible = True
+            for _ in range(num_kicks):
+                temp_tour = double_bridge_move(temp_tour)
+                # Ensure finite after each kick? Or just at end?
+                # Best to check at end.
+            
+            l = tour_length_jit(temp_tour, D)
+            if l < 1e20:
+                pop[idx] = temp_tour
+                fit[idx] = l
+                valid_kick = True
+                break
+        
+        if not valid_kick:
+            # Fallback: Manual Random Insertion (Mild but Safe)
+            pop[idx] = best_tour[:]
+            n_ = n
+            # Apply 5 random insertions as before
+            for _ in range(5):
+                p1 = np.random.randint(0, n_)
+                p2 = np.random.randint(0, n_)
+                if p1 != p2:
+                    city = pop[idx][p1]
+                    if p1 < p2:
+                        for k in range(p1, p2):
+                            pop[idx][k] = pop[idx][k+1]
+                        pop[idx][p2] = city
+                    else:
+                        for k in range(p1, p2, -1):
+                            pop[idx][k] = pop[idx][k-1]
+                        pop[idx][p2] = city
+            fit[idx] = tour_length_jit(pop[idx], D)
 
 
 # ==============================================================================
@@ -1634,6 +1808,44 @@ class r0123456:
                     div_dist, div_ent = calc_diversity_metrics_jit(population, population[best_idx])
                     print(f"Gen {gen:4d} | Best: {bestObjective:.2f} | Div: {div_dist:.1f} | Ent: {div_ent:.3f}")
                     _diversity_computed = True
+                    
+                    # --- Population Resync Check (Culling) ---
+                    # 1. Count Infinites (Invalid Solutions)
+                    inf_count = np.sum(np.isinf(fitness))
+                    inf_ratio = inf_count / self.lam
+                    
+                    # 2. Check Divergence (Gap)
+                    valid_mask = np.isfinite(fitness)
+                    if np.any(valid_mask):
+                        valid_mean = fitness[valid_mask].mean()
+                        gap_ratio = (valid_mean - bestObjective) / bestObjective
+                    else:
+                        gap_ratio = 999.0 # All inf
+
+                    trigger_resync = False
+                    cutoff = 0.3 # Default
+                    
+                    if inf_ratio > 0.0:
+                        # If we have Infs, kill them all + 10% valid margin (max 80% to keep some diversity)
+                        trigger_resync = True
+                        cutoff = min(0.8, inf_ratio + 0.1) 
+                        print(f"[Exploiter] RESYNC: Found {inf_count} INFs ({inf_ratio:.1%}). Culling worst {cutoff:.1%}.")
+                        
+                    # 如果没有 inf，但健康度极差 (Gap > 100%)，也触发 Resync
+                    # 这通常意味着种群已经离散，不再围绕 Elite 搜索
+                    elif inf_count == 0 and gap_ratio > 1.0: # Gap > 100% triggers Resync
+                        trigger_resync = True
+                        cutoff = 0.5
+                        print(f"[Exploiter] RESYNC: Gap {gap_ratio*100:.1f}% > 100%. Culling worst {cutoff:.1%}.")
+                        
+                    if trigger_resync:
+                         resync_seed = int(self.rng.integers(1 << 30))
+                         # Call JIT Resync
+                         _resync_population_jit(population, fitness, population[best_idx], D, resync_seed, cutoff)
+                         # Update metrics
+                         valid_mask = np.isfinite(fitness)
+                         meanObjective = float(fitness[valid_mask].mean()) if np.any(valid_mask) else float('inf')
+                         print(f"[Exploiter] Resync Done. New Valid Mean: {meanObjective:.2f}")
             
             if self.stagnation_counter >= gls_trigger:  # 触发GLS
                 gls_active = True  # 开启GLS
@@ -1731,9 +1943,7 @@ class r0123456:
         best_local = np.argmin(fitness[cand])
         return cand[best_local]
 
-    def _erx(self, p1: np.ndarray, p2: np.ndarray) -> np.ndarray:
-        """调用 JIT 版 ERX 交叉"""
-        return _erx_jit(p1, p2)
+
 
     def _hybrid_mutation_inplace(self, tour: np.ndarray) -> None:
         """混合变异：70% 反转 (Inversion), 30% 插入 (Insertion)"""
@@ -1777,6 +1987,10 @@ class r0123456:
                 improved = True  # 标记改进
                 continue  # 回到k=1
             dlb_mask[:] = False  # 重置DLB
+            if _candidate_block_swap_jit(tour, D, knn_idx, max_iters=block_steps, dlb_mask=dlb_mask, block_size=2):  # 段交换
+                improved = True  # 标记改进
+                continue  # 回到k=1
+            dlb_mask[:] = False  # 重置DLB
             if _candidate_or_opt_jit(tour, D, knn_idx, max_iters=block_steps, dlb_mask=dlb_mask, block_size=2):  # k=2
                 improved = True  # 标记改进
                 continue  # 回到k=1
@@ -1807,30 +2021,6 @@ class r0123456:
             if util >= max_util - 1e-12:  # 选中最大边
                 penalties[a, b] += 1  # 增加惩罚
 
-    def _light_two_opt_inplace(self, tour: np.ndarray, D: np.ndarray, finite_mask: np.ndarray, max_steps: int):
-        """调用 JIT 版局部搜索 (混合 2-opt 和 Or-opt)"""
-        # P0: If Asymmetric, DISABLE 2-Opt
-        if not self._is_symmetric:
-            bs = int(self.rng.integers(1, 4))
-            _or_opt_once_jit(tour, D, bs)
-            return
-
-        steps = int(max_steps)
-        for _ in range(steps):
-             # 80% 概率做 2-opt, 20% 概率做 Or-opt
-            if self.rng.random() < 0.8:
-                if not _two_opt_once_jit_safe(tour, D):
-                     # 如果 2-opt 失败，尝试 Or-opt 救一下
-                    if not _or_opt_once_jit(tour, D, 3): # 尝试移动长度为 3 的块
-                         break
-            else:
-                 # 随机选择块大小 1, 2, 3
-                bs = int(self.rng.integers(1, 4))
-                if not _or_opt_once_jit(tour, D, bs):
-                    # 如果 Or-opt 失败，尝试 2-opt
-                     if not _two_opt_once_jit_safe(tour, D):
-                        break
-
     def _repair_inplace(self, tour: np.ndarray, D: np.ndarray, finite_mask: np.ndarray):
         """调用 JIT 版修复逻辑"""
         # P0: If Asymmetric, DISABLE 2-Opt based repair
@@ -1838,20 +2028,7 @@ class r0123456:
             return
             
         _repair_jit(tour, D, finite_mask)
-
-    def _tour_feasible(self, tour: np.ndarray, finite_mask: np.ndarray) -> bool:
-        """调用 JIT 版可行性检查"""
-        return _tour_feasible_jit(tour, finite_mask)
-
-    def _greedy_feasible_tour(self, D: np.ndarray, finite_mask: np.ndarray) -> np.ndarray:
-        """生成一个可行解的兜底方法 (RCL-NN)"""
-        try:
-            r = 5
-            return _rcl_nn_tour_jit(D, finite_mask, self._knn_idx, r)
-        except Exception:
-            # 极端情况 fallback
-            n = D.shape[0]
-            return _rand_perm_jit(n) 
+ 
 
     def _rotate_to_start(self, tour: np.ndarray, start_city: int) -> np.ndarray:
         """旋转路径使 start_city 位于首位 (用于标准化输出)"""

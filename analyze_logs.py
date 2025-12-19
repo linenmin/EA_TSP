@@ -16,9 +16,14 @@ def load_logs(island_0_log, island_1_log):
     df1['island'] = 1
     return df0, df1
 
-def plot_convergence(df0, df1, output_file='convergence.png', problem_name=None):
+def plot_convergence(df0, df1, output_file=None, problem_name=None, ax=None):
     """绘制收敛曲线对比图"""
-    fig, ax1 = plt.subplots(figsize=(12, 6))
+    if ax is None:
+        fig, ax1 = plt.subplots(figsize=(12, 6))
+    else:
+        ax1 = ax
+        fig = ax.get_figure()
+
     ax2 = ax1.twiny()
     
     # Exploiter on Primary X (Bottom)
@@ -49,19 +54,23 @@ def plot_convergence(df0, df1, output_file='convergence.png', problem_name=None)
     
     # Focus on stable part (zoom in Y-axis)
     # Filter out the initial high values by setting max Y to 30% above best
-    y_limit = overall_best * 1.05
+    y_limit = overall_best * 1.02
     ax1.set_ylim(bottom=overall_best * 0.9999, top=y_limit)
     
     ax1.grid(True, alpha=0.3)
     
-    plt.tight_layout()
-    plt.savefig(output_file, dpi=150)
-    print(f"[Saved] {output_file}")
+    if output_file:
+        plt.tight_layout()
+        plt.savefig(output_file, dpi=150)
+        print(f"[Saved] {output_file}")
     return fig
 
-def plot_diversity(df0, df1, output_file='diversity.png', problem_name=None):
+def plot_diversity(df0, df1, output_file=None, problem_name=None, axes=None):
     """绘制多样性变化图 (Dual X-Axis)"""
-    fig, axes = plt.subplots(2, 1, figsize=(12, 8), sharex=False)
+    if axes is None:
+        fig, axes = plt.subplots(2, 1, figsize=(12, 8), sharex=False)
+    else:
+        fig = axes[0].get_figure()
     
     # --- Subplot 1: Bond Distance ---
     ax1 = axes[0]
@@ -102,27 +111,34 @@ def plot_diversity(df0, df1, output_file='diversity.png', problem_name=None):
     ax2.legend(lines2, [l.get_label() for l in lines2], loc='upper right')
     ax2.grid(True, alpha=0.3)
     
-    plt.tight_layout()
-    plt.savefig(output_file, dpi=150)
-    print(f"[Saved] {output_file}")
+    if output_file:
+        plt.tight_layout()
+        plt.savefig(output_file, dpi=150)
+        print(f"[Saved] {output_file}")
     return fig
 
-def plot_events(df0, df1, output_file='events.png', problem_name=None):
+def plot_events(df0, df1, output_file=None, problem_name=None, axes=None):
     """绘制事件时间线 (RTR接受率 + 迁移事件) - Independent X Axes"""
-    fig, axes = plt.subplots(3, 1, figsize=(12, 12), sharex=False)
+    if axes is None:
+        fig, axes = plt.subplots(3, 1, figsize=(12, 12), sharex=False)
+    else:
+        fig = axes[0].get_figure()
     
     # === Subplot 1: RTR Accept Rate (Dual Scale) ===
     ax1 = axes[0]
     ax1b = ax1.twiny()
     
     window = 50
-    df0['rtr_rate'] = df0['rtr_accepts'].rolling(window).mean()
-    df1['rtr_rate'] = df1['rtr_accepts'].rolling(window).mean()
+    # Use copy to avoid SettingWithCopyWarning
+    df0_c = df0.copy()
+    df1_c = df1.copy()
+    df0_c['rtr_rate'] = df0_c['rtr_accepts'].rolling(window).mean()
+    df1_c['rtr_rate'] = df1_c['rtr_accepts'].rolling(window).mean()
     
     # Exploiter
-    l1, = ax1.plot(df0['gen'], df0['rtr_rate'], label='Exploiter RTR Rate', alpha=0.7, color='blue')
+    l1, = ax1.plot(df0_c['gen'], df0_c['rtr_rate'], label='Exploiter RTR Rate', alpha=0.7, color='blue')
     # Scout
-    l2, = ax1b.plot(df1['gen'], df1['rtr_rate'], label='Scout RTR Rate', alpha=0.7, color='green', linestyle='--')
+    l2, = ax1b.plot(df1_c['gen'], df1_c['rtr_rate'], label='Scout RTR Rate', alpha=0.7, color='green', linestyle='--')
     
     ax1.set_ylabel(f'RTR Accepts (rolling {window})')
     title1 = 'Selection Pressure (Exploiter vs Scout)'  # 标题模板
@@ -190,16 +206,20 @@ def plot_events(df0, df1, output_file='events.png', problem_name=None):
     ax3.grid(True, alpha=0.3)
 
     
-
-    
-    plt.tight_layout()
-    plt.savefig(output_file, dpi=150)
-    print(f"[Saved] {output_file}")
+    if output_file:
+        plt.tight_layout()
+        plt.savefig(output_file, dpi=150)
+        print(f"[Saved] {output_file}")
     return fig
 
-def plot_stagnation(df0, df1, output_file='stagnation.png', problem_name=None):
+def plot_stagnation(df0, df1, output_file=None, problem_name=None, ax=None):
     """绘制停滞计数曲线 (Dual X-Axis)"""
-    fig, ax1 = plt.subplots(figsize=(12, 5))
+    if ax is None:
+        fig, ax1 = plt.subplots(figsize=(12, 5))
+    else:
+        ax1 = ax
+        fig = ax.get_figure()
+
     ax2 = ax1.twiny()
     
     # Exploiter
@@ -220,9 +240,10 @@ def plot_stagnation(df0, df1, output_file='stagnation.png', problem_name=None):
     ax1.legend(lines, [l.get_label() for l in lines], loc='upper right')
     ax1.grid(True, alpha=0.3)
     
-    plt.tight_layout()
-    plt.savefig(output_file, dpi=150)
-    print(f"[Saved] {output_file}")
+    if output_file:
+        plt.tight_layout()
+        plt.savefig(output_file, dpi=150)
+        print(f"[Saved] {output_file}")
     return fig
 
 
@@ -268,9 +289,13 @@ def _compute_spike_ratio(series, quantile=0.9):  # 尖峰比例
     return ratio, threshold, spike_count, total_count  # 返回结果
 
 
-def plot_diagnostics(df0, df1, output_file='diagnostics.png', problem_name=None):  # 诊断图
+def plot_diagnostics(df0, df1, output_file=None, problem_name=None, axes=None):  # 诊断图
     """绘制额外诊断指标"""
-    fig, axes = plt.subplots(3, 1, figsize=(12, 10), sharex=False)  # 画布
+    if axes is None:
+        fig, axes = plt.subplots(3, 1, figsize=(12, 10), sharex=False)  # 画布
+    else:
+        fig = axes[0].get_figure()
+
     window = 50  # 平滑窗口
     
     best_delta = df0['best_fit'].diff()  # 最优差分
@@ -309,10 +334,41 @@ def plot_diagnostics(df0, df1, output_file='diagnostics.png', problem_name=None)
     ax3.set_ylim(0, 1)  # 固定范围
     ax3.grid(True, alpha=0.3)  # 网格
     
-    plt.tight_layout()  # 紧凑布局
-    plt.savefig(output_file, dpi=150)  # 保存图片
-    print(f"[Saved] {output_file}")  # 输出提示
+    if output_file:
+        plt.tight_layout()  # 紧凑布局
+        plt.savefig(output_file, dpi=150)  # 保存图片
+        print(f"[Saved] {output_file}")  # 输出提示
     return fig  # 返回图像
+
+
+def plot_combined(df0, df1, output_file, problem_name=None):
+    """合并四个核心诊断图为一张大长图"""
+    # 核心诊断图共有 1 (convergence) + 3 (diagnostics) + 2 (diversity) + 3 (events) = 9 个子图
+    fig = plt.figure(figsize=(15, 45))
+    gs = fig.add_gridspec(9, 1, height_ratios=[1.5, 1, 1, 1, 1, 1, 1, 0.8, 1.5], hspace=0.4)
+    
+    # 预创建 axes
+    ax_conv = fig.add_subplot(gs[0])
+    axes_diag = [fig.add_subplot(gs[1]), fig.add_subplot(gs[2]), fig.add_subplot(gs[3])]
+    axes_div = [fig.add_subplot(gs[4]), fig.add_subplot(gs[5])]
+    axes_events = [fig.add_subplot(gs[6]), fig.add_subplot(gs[7]), fig.add_subplot(gs[8])]
+    
+    # 调用原有的绘图逻辑 (不保存到文件)
+    plot_convergence(df0, df1, problem_name=problem_name, ax=ax_conv)
+    plot_diagnostics(df0, df1, problem_name=problem_name, axes=axes_diag)
+    plot_diversity(df0, df1, problem_name=problem_name, axes=axes_div)
+    plot_events(df0, df1, problem_name=problem_name, axes=axes_events)
+    
+    # 全局标题
+    title = "TSP Island Model Full Diagnostic Report"
+    if problem_name:
+        title = f"{problem_name} | {title}"
+    fig.suptitle(title, fontsize=24, y=0.99)
+    
+    # 显式调整间距
+    plt.savefig(output_file, dpi=120, bbox_inches='tight')
+    plt.close(fig)
+    print(f"[Saved Combined Report] {output_file}")
 
 
 def print_summary(df0, df1):
@@ -393,7 +449,7 @@ def main():
     # 用户配置区域：只需要填入日志文件夹路径
     # ==============================================================================
     
-    LOG_FOLDER = "logs_20251219_155442"  # 填入日志文件夹名称
+    LOG_FOLDER = "logs_20251219_201255"  # 填入日志文件夹名称
     
     # ==============================================================================
     
@@ -442,6 +498,9 @@ def main():
         plot_events(df0, df1, f"{prefix}events.png", problem)  # 事件图
         plot_stagnation(df0, df1, f"{prefix}stagnation.png", problem)  # 停滞图
         plot_diagnostics(df0, df1, f"{prefix}diagnostics.png", problem)  # 诊断图
+        
+        # 合并图表
+        plot_combined(df0, df1, f"{prefix}combined_report.png", problem)
         
         # 打印摘要
         print_summary(df0, df1)

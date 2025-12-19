@@ -6,33 +6,13 @@ import random
 from optimized_thread_LocalSearch_inf import r0123456
 
 # ==============================================================================
-# 全局开关
+# 配置区域 (Configuration)
 # ==============================================================================
-# ==============================================================================
-# 全局开关
-# ==============================================================================
-ENABLE_MIGRATION = True  # Enable for Scout -> Exploiter flow
 
-# ==============================================================================
-# 1. 基础问题配置 (Base Configs per Problem)
-# ==============================================================================
-# 种群大小随城市数量线性或超线性增长
-# ==============================================================================
-# 1. 基础问题配置 (Base Configs per Problem)
-# ==============================================================================
-# 策略：反比配置 (Inverse Scaling)
-# 小图计算快，可以使用超大种群来保证多样性。
-# 大图计算慢，必须减小种群规模以换取迭代代数。
-# ==============================================================================
-# 1. 基础问题配置 (Base Configs per Problem)
-# ==============================================================================
-# 策略：根据 HPC 超参搜索结果，为每个问题设置最优参数
-# 搜索日期: 2024-12-16
-# ==============================================================================
+# 基础问题参数配置 (根据问题规模调整)
 PROBLEM_CONFIGS = {
     "tour50.csv": {
         "N_RUNS": 10_000_000, "lam": 5000, "stagnation_limit": 800,
-        # 岛屿特定参数 (默认值，小问题不需要精细调参)
         "exploit_mut": 0.3, "explore_mut": 0.8,
         "exploit_ls": 30, "explore_ls": 15
     },
@@ -42,76 +22,69 @@ PROBLEM_CONFIGS = {
         "exploit_ls": 30, "explore_ls": 15
     },
     "tour500.csv": {
-        # HPC 最佳: 99562 (run 4)
+        # 针对 tour500 的特殊优化配置 (降低变异率，增加LS)
         "N_RUNS": 10_000_000, "lam": 300, "stagnation_limit": 300,
-        "exploit_mut": 0.4, "explore_mut": 0.6,
+        "exploit_mut": 0.1, "explore_mut": 0.6,
         "exploit_ls": 40, "explore_ls": 15
     },
     "tour750.csv": {
-        # 诊断发现: 400 代不足，需要更多代数
-        # 方案: 减小 λ (150→100), 减少 LS 步数 (30→20)
+        # 减小种群规模以加速迭代，降低变异率
         "N_RUNS": 10_000_000, "lam": 100, "stagnation_limit": 200,
-        "exploit_mut": 0.4, "explore_mut": 0.8,
+        "exploit_mut": 0.1, "explore_mut": 0.8,
         "exploit_ls": 20, "explore_ls": 10
     },
     "tour1000.csv": {
-        # HPC 最佳: 63848 (run 1)
+        # 大规模问题配置
         "N_RUNS": 10_000_000, "lam": 100, "stagnation_limit": 150,
-        "exploit_mut": 0.2, "explore_mut": 0.6,
+        "exploit_mut": 0.1, "explore_mut": 0.6,
         "exploit_ls": 30, "explore_ls": 15
     }
 }
 
-# 默认配置 (如果不匹配)
+# 默认配置 (兜底)
 DEFAULT_CONFIG = {
     "N_RUNS": 10_000_000, "lam": 200, "stagnation_limit": 200,
-    "exploit_mut": 0.3, "explore_mut": 0.8, "exploit_ls": 30, "explore_ls": 15
+    "exploit_mut": 0.3, "explore_mut": 0.8, 
+    "exploit_ls": 30, "explore_ls": 15
 }
 
 # ==============================================================================
-# 2. 岛屿角色修正 (Role Modifiers)
+# 核心逻辑 (Core Logic)
 # ==============================================================================
-# 迁移策略: Scout -> Exploiter (One Way)
-# - Scout: 小种群, 强 LS, 频繁重启. 发送 Best 给 Exploiter.
-# - Exploiter: 正常进化, 接收 Scout 的 Best (贪婪吸收).
-# ==============================================================================
+
 def apply_role(base_config, role):
-    """
-    根据岛屿角色 (0=Exploiter, 1=Scout) 应用配置。
-    """
+    """根据岛屿角色 (0=Exploiter, 1=Scout) 生成特定配置"""
+    # 复制基础配置
     cfg = {"N_RUNS": base_config["N_RUNS"], "lam": base_config["lam"], "mu": base_config["lam"]}
     
-    if role == 0:  # Exploiter (精耕细作)
-        cfg["k_tournament"] = 5
-        cfg["mutation_rate"] = base_config["exploit_mut"]
-        cfg["local_rate"] = 1.0
-        cfg["ls_max_steps"] = base_config["exploit_ls"]
-        cfg["stagnation_limit"] = int(base_config["stagnation_limit"] * 0.8)
+    if role == 0:  # Exploiter (精耕细作型)
+        cfg["k_tournament"] = 5  # 高选择压力
+        cfg["mutation_rate"] = base_config["exploit_mut"]  # 低变异率
+        cfg["local_rate"] = 1.0  # 全局LS
+        cfg["ls_max_steps"] = base_config["exploit_ls"]  # 深度LS
+        cfg["stagnation_limit"] = int(base_config["stagnation_limit"] * 0.8) # 较早重启
         
-    else:  # Scout (快速侦察兵)
-        cfg["k_tournament"] = 2
-        # Scout 使用固定小种群 (e.g. 150) 以便快速迭代，但比 100 稍大以增加多样性
-        cfg["lam"] = 150
+    else:  # Scout (快速侦察型)
+        cfg["k_tournament"] = 2  # 低选择压力
+        cfg["lam"] = 150  # 固定小种群
         cfg["mu"] = 150
-        cfg["mutation_rate"] = 0.5 # Moderate mutation
-        cfg["local_rate"] = 1.0    # 必须强 LS 才能产出高质量解
-        cfg["ls_max_steps"] = 50   # Deep Search
-        # 动态停滞阈值: 至少 100 代，或者是 Base Config 的 40% (针对小种群优化)
-        # 这确保了在 tour500/750/1000 等大图上有足够的收敛时间，而不是"幼儿期夭折"
+        cfg["mutation_rate"] = 0.5 # 中等变异
+        cfg["local_rate"] = 1.0    # 强LS保证质量
+        cfg["ls_max_steps"] = 50   # 深度搜索
+        # 动态停滞阈值，防止夭折
         cfg["stagnation_limit"] = max(100, int(base_config["stagnation_limit"] * 0.4))
         
     return cfg
 
 def island_worker(island_id, config, csv_file, mig_queue, recv_queue, log_file=None):
-    """
-    Worker function for a single island process.
-    """
+    """岛屿工作进程函数"""
     role_name = "Exploiter" if island_id == 0 else "Explorer"
     print(f"[Launcher] Island {island_id} ({role_name}) starting (PID: {os.getpid()})...")
     
-    # Initialize solver with unique seed offset
+    # 随机种子偏移
     seed = random.randint(0, 100000) + island_id * 999
     
+    # 初始化求解器
     solver = r0123456(
         N_RUNS=config["N_RUNS"],
         lam=config["lam"],
@@ -122,91 +95,18 @@ def island_worker(island_id, config, csv_file, mig_queue, recv_queue, log_file=N
         ls_max_steps=config["ls_max_steps"],
         stagnation_limit=config["stagnation_limit"],
         rng_seed=seed,
-        log_file=log_file  # 诊断日志文件
+        log_file=log_file  # 诊断日志
     )
     
-    # Run optimization (blocking)
+    # 运行优化 (阻塞直到完成)
     solver.optimize(csv_file, mig_queue=mig_queue, recv_queue=recv_queue, island_id=island_id)
     
     print(f"[Launcher] Island {island_id} finished.")
 
-def run_single_problem(target_csv, enable_log=True, log_folder="."):
-    """运行单个问题的双岛屿模型
-    
-    Args:
-        target_csv: 目标 CSV 文件名
-        enable_log: 是否启用诊断日志
-        log_folder: 日志存放文件夹路径
-    """
-    print("=" * 60)
-    print(f"Starting Parallel Island Model (2 Islands)")
-    print(f"Target: {target_csv}")
-    print(f"Log folder: {log_folder}")
-    print("=" * 60)
-    
-    if not os.path.exists(target_csv):
-        print(f"Error: {target_csv} not found! Skipping...")
-        return
-    
-    # 获取基础配置
-    base_cfg = PROBLEM_CONFIGS.get(target_csv, DEFAULT_CONFIG)
-    
-    # 生成岛屿专属配置
-    cfg0 = apply_role(base_cfg, 0)
-    cfg1 = apply_role(base_cfg, 1)
-    
-    print(f"Config 0 (Exploiter): lam={cfg0['lam']}, mut={cfg0['mutation_rate']}, ls={cfg0['ls_max_steps']}")
-    print(f"Config 1 (Explorer):  lam={cfg1['lam']}, mut={cfg1['mutation_rate']}, ls={cfg1['ls_max_steps']}")
-
-    # Create communication queues
-    q1 = multiprocessing.Queue(maxsize=50)
-    q2 = multiprocessing.Queue(maxsize=50)
-    
-    # 诊断日志文件路径 (存入时间戳文件夹)
-    if enable_log:
-        log_0 = os.path.join(log_folder, f"island_0_{target_csv.replace('.csv', '')}_log.csv")
-        log_1 = os.path.join(log_folder, f"island_1_{target_csv.replace('.csv', '')}_log.csv")
-        print(f"[Diagnostic] Logs: {log_0}, {log_1}")
-    else:
-        log_0 = None
-        log_1 = None
-    
-    # 修改进程创建 
-    mig_q1 = q1 if ENABLE_MIGRATION else None
-    mig_q2 = q2 if ENABLE_MIGRATION else None
-
-    # Define processes
-    p1 = multiprocessing.Process(
-        target=island_worker,
-        args=(0, cfg0, target_csv, mig_q1, mig_q2, log_0) 
-    )
-    
-    p2 = multiprocessing.Process(
-        target=island_worker,
-        args=(1, cfg1, target_csv, mig_q2, mig_q1, log_1) 
-    )
-
-    try:
-        p1.start()
-        p2.start()
-        p1.join()
-        p2.join()
-        
-    except KeyboardInterrupt:
-        print("\n[Launcher] Stopping islands...")
-        p1.terminate()
-        p2.terminate()
-        p1.join()
-        p2.join()
-        print("[Launcher] Stopped.")
-
-
 def main():
-    # ==============================================================================
-    # 用户配置区域
-    # ==============================================================================
+    """主函数：并行启动岛屿模型"""
     
-    # 选择要运行的文件列表 (并行执行)
+    # 要运行的目标文件列表
     TARGET_FILES = [
         "tour500.csv",
         "tour750.csv",
@@ -217,9 +117,8 @@ def main():
     
     # 是否启用诊断日志
     ENABLE_DIAGNOSTIC_LOG = True
-    # ==============================================================================
     
-    # 创建时间戳文件夹存放日志
+    # 创建带时间戳的日志文件夹
     from datetime import datetime
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_folder = f"logs_{timestamp}"
@@ -229,27 +128,26 @@ def main():
     
     print("=" * 60)
     print(f"并行运行模式: {len(TARGET_FILES)} 个问题同时运行")
-    print(f"问题列表: {TARGET_FILES}")
     print(f"总进程数: {len(TARGET_FILES) * 2} (每个问题 2 个岛屿)")
     print("=" * 60)
     
-    # 收集所有进程和队列
     all_processes = []
     all_queues = []
     
+    # 遍历每个问题启动进程
     for target_csv in TARGET_FILES:
         if not os.path.exists(target_csv):
             print(f"[Warning] {target_csv} not found! Skipping...")
             continue
         
-        # 获取配置
+        # 获取配置并生成角色配置
         base_cfg = PROBLEM_CONFIGS.get(target_csv, DEFAULT_CONFIG)
-        cfg0 = apply_role(base_cfg, 0)
-        cfg1 = apply_role(base_cfg, 1)
+        cfg0 = apply_role(base_cfg, 0) # Exploiter
+        cfg1 = apply_role(base_cfg, 1) # Explorer
         
         print(f"[{target_csv}] Exploiter: lam={cfg0['lam']}, Explorer: lam={cfg1['lam']}")
         
-        # 诊断日志 (存入时间戳文件夹)
+        # 设置日志路径
         if ENABLE_DIAGNOSTIC_LOG:
             log_0 = os.path.join(log_folder, f"island_0_{target_csv.replace('.csv', '')}_log.csv")
             log_1 = os.path.join(log_folder, f"island_1_{target_csv.replace('.csv', '')}_log.csv")
@@ -257,29 +155,26 @@ def main():
             log_0 = None
             log_1 = None
         
-        # 为每个问题创建独立的通信队列
+        # 创建通信队列
         q1 = multiprocessing.Queue(maxsize=10)
         q2 = multiprocessing.Queue(maxsize=10)
-        
-        # 收集队列用于后续清理
         all_queues.extend([q1, q2])
         
-        # 创建进程
+        # 创建进程 0 (Exploiter)
         p1 = multiprocessing.Process(
             target=island_worker,
             args=(0, cfg0, target_csv, q1, q2, log_0),
             name=f"{target_csv}_Exploiter"
         )
+        # 创建进程 1 (Scout)
         p2 = multiprocessing.Process(
             target=island_worker,
             args=(1, cfg1, target_csv, q2, q1, log_1),
             name=f"{target_csv}_Explorer"
         )
         
-        # 设置为 daemon 进程，主进程退出时自动终止
         p1.daemon = True
         p2.daemon = True
-        
         all_processes.extend([p1, p2])
     
     print(f"\n启动 {len(all_processes)} 个进程...")
@@ -289,7 +184,7 @@ def main():
         for p in all_processes:
             p.start()
         
-        # 等待所有进程完成 (带超时)
+        # 等待所有进程完成
         for p in all_processes:
             p.join(timeout=310)  # 5.5 分钟超时
             if p.is_alive():
@@ -305,10 +200,9 @@ def main():
             p.join(timeout=5)
     
     finally:
-        # 清理队列，防止死锁
+        # 清理队列资源
         for q in all_queues:
-            q.cancel_join_thread()  # 告诉 Python 不要等待写入完成
-            # 清空队列
+            q.cancel_join_thread()
             try:
                 while True:
                     q.get_nowait()
@@ -319,8 +213,6 @@ def main():
     print("所有问题运行完成!")
     print("=" * 60)
 
-
 if __name__ == "__main__":
-    # Windows support for multiprocessing
     multiprocessing.freeze_support()
     main()
