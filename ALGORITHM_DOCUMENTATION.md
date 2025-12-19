@@ -103,6 +103,12 @@
 - **候选列表**: 使用 KNN (K=32) 加速，只尝试移动到最近邻附近。
 
 
+### VND Or-Opt (k=1/2/3) [NEW]
+- **k=1**: 候选列表 Or-Opt + DLB，精细改进。
+- **k=2/3**: 小步数块移动（不反转，ATSP 安全），补全中等规模结构调整。
+- **使用节点**: 精英 LS / Trauma Center 康复 / Kick 修补 / 重启前抛光。
+- **目的**: 避免只靠单点插入导致的早期锁死。
+
 ### 4. 搜索加速 (Search Acceleration) [NEW]
 为了提升大规模问题 (ATSP/TSP) 的搜索效率，引入了以下关键技术：
 
@@ -111,14 +117,20 @@
     *   **应用**: 集成于 `Or-Opt` 和局部搜索主循环。
     *   **效果**: 在收敛后期显著减少无效计算，提升搜索速度 3-5 倍。
 
-2.  **Kick Strategy (Double Bridge + Swap)**
+2.  **Kick Strategy (Double Bridge)**
     *   **Double Bridge (4-Opt Kick)**: 将路径切为 4 段并重组 (A-B-C-D -> A-D-C-B)。此操作对 ATSP 安全（不反转方向），且能跨越 2-Opt 无法逃离的局部最优。
-    *   **Swap Segments (3-Opt Variant)**: 随机交换两个不相邻的片段。同样是 ATSP 安全的扰动。
     *   **触发机制**: 当停滞代数超过阈值的 50% 时，对精英个体执行 Kick 并尝试替换最差个体，从死局中“踢”出来。
 
 3.  **Elite-Only Local Search**
-    *   **策略**: 只对前 20% 的精英子代执行深度局部搜索 (DLB-Or-Opt)。
+    *   **策略**: 只对前 20% 的精英子代执行 VND Or-Opt (k=1/2/3)。
     *   **目的**: 集中算力于高潜力个体，避免对劣质解浪费计算资源。
+
+4.  **Guided Local Search (GLS)**
+    *   **触发**: stagnation >= 0.6 * limit，每 50 代更新一次惩罚。
+    *   **代价**: D_gls = D + lambda * P，lambda = 0.03 * (best / n)。
+    *   **复位**: new best / restart / MIRACLE 时清空惩罚。
+    *   **候选**: GLS 激活时 K 扩大至 64，破解 KNN 锁死。
+    *   **说明**: 只影响 LS 决策，适应度仍用原始 D。
 
 ---
 
@@ -180,10 +192,39 @@
     - **逻辑**: 初始精密手术 (15%) -> 若无效则加大剂量 -> 最高截肢 (50%) -> 一旦好转立即重置回 15%。
 
 ### 8.3 多样性回流 (Diversity Injection)
+### 8.3 多样性回流 (The Trojan Horse Protocol)
 - **问题**: 早期版本只允许 "更好 (Strict Improvement)" 的解出院，导致 Scout 经常沉默，Exploiter 缺乏外部基因流入。
-- **解决方案**: **Relaxed Discharge**.
-    - 允许 **相近 (Equal)** 或 **更优 (Better)** 的解出院。
-    - **节流阀 (Throttle)**: 对 "Equal" 解施加冷却时间 (200 iters)，防止刷屏。
-    - **效果**: 持续向 Exploiter 输送结构不同但质量相当的 "康复变体"，有效维持了种群多样性。
+- **解决方案**: **Relaxed Discharge (特洛伊木马)**.
+    - **逻辑**: 允许 "结构迥异" 且 "质量相近 (Tolerance)" 的解回流。
+    - **动态宽容 (Dynamic Tolerance)**: 
+        - Scout 根据自身的 **Stagnation** 程度动态调整 Tolerance。
+        - 停滞 < 50: 0% (Strict Mode).
+        - 停滞 > 50: 2%.
+        - 停滞 > 200: 5% (Desperate Mode).
+    - **Stagnation Persistence**: 当发送 Trojan (非最优但符合 Tolerance) 时，Scout **不重置** 自身的停滞计数器。只有这样，Scout 才能保持在高 Tolerance 状态，持续向 Exploiter 输送多样性，直到真正实现全局突破。
+
+### 8.4 拓扑径向破坏 (Topological Radial Ruin - BFS)
+- **问题**: 常规 Random Ruin 在 TSP 中效率低下。Spatial Radial Ruin 需要坐标，但我们只有距离矩阵。
+- **解决方案**: **KNN-BFS Ruin**.
+    - 利用预计算的 **KNN 列表** (K=32)。
+    - 从随机中心点开始，进行 **广度优先搜索 (BFS)**，直到抓取到 N_Remove (e.g., 200) 个城市。
+    - **效果**: 保证了被移除的城市在拓扑空间（距离图）上是一个紧密连接的 **Cluster (连通块)**，这在无坐标的情况下完美实现了 Radial Ruin 的效果。
+    - **优势**: 迫使算法重建局部高密区域的连接，极大提升了跳出局部最优的能力。
 
 ---
+
+## 9. 最新结果与分析 (Performance Update 2025-12-19)
+
+### 9.1 总体进步
+- **整体最优**: 不同规模实例的 Overall Best 进入 ~104.2k / ~98.8k / ~56.8k 区间，相比此前 105k+ / 99k+ / 57k+ 明显下探。
+- **收敛节奏**: 早期快速下降 + 中后期缓慢爬坡的形态更稳定，尾段仍持续产生小改进，说明上限被抬高。
+
+### 9.2 行为指标解读
+- **选择压力**: RTR rolling accept rate 长期保持在稳定区间，没有提前归零，说明 Exploiter 仍有可接受的改进空间。
+- **多样性**: Bond Distance / Edge Entropy 在中后期仍有周期性尖峰，显示 Kick + GLS 能持续注入结构扰动，避免完全冻结。
+- **Trauma Center 贡献**: 出院事件达到几十次级别，已从“几乎无用”转为“稳定输出”，但主导改进仍在 Exploiter。
+
+### 9.3 结论与下一步
+- **结论**: VND Or-Opt + GLS 的组合显著抬高了上限，并延长了有效爬坡时间。
+- **风险点**: 若 GLS 触发过频或 K 扩大过早，可能导致局搜成本过高、收益变小。
+- **建议**: 维持当前策略结构，优先用日志监控 GLS 触发频率与平均改进量，再考虑更重的算子。

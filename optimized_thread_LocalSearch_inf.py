@@ -28,7 +28,7 @@ _numba_threads_env = os.environ.get("NUMBA_NUM_THREADS", None)
 if _numba_threads_env is not None:
     _max_threads = int(_numba_threads_env)
 else:
-    _max_threads = 4  # 默认使用 4 个线程
+    _max_threads = 1  # 默认使用 1 个线程
 set_num_threads(_max_threads)
 
 
@@ -36,83 +36,7 @@ set_num_threads(_max_threads)
 # Part 1: JIT Accelerated Helper Functions (JIT加速辅助函数)
 # ==============================================================================
 
-@njit(cache=True, fastmath=True)
-def _erx_jit(p1, p2):
-    """
-    边缘重组交叉 (Edge Recombination Crossover, ERX) 的 JIT 实现。
-    旨在保留父代的邻接关系（边），适合 TSP 问题。
-    """
-    n = p1.size  # 获取城市数量（基因长度）
-    child = np.empty(n, np.int32)  # 初始化子代数组
-    used = np.zeros(n, np.uint8)  # 标记数组，记录城市是否已加入子代
-    
-    # 构建邻接表：每个城市最多4个邻居（来自两个父代的左右邻居）
-    # neighbors: (n, 4) 存储邻居索引，-1 表示空位
-    neighbors = np.full((n, 4), -1, np.int32)
-    deg = np.zeros(n, np.int32)  # 记录每个城市的当前邻居数量
 
-    # 内部函数：向 u 的邻接表中添加 v
-    def add_edge(u, v):
-        if v == u: return  # 忽略自环
-        for k in range(deg[u]):  # 检查是否已存在该边
-            if neighbors[u, k] == v:
-                return
-        if deg[u] < 4:  # 若邻居未满，则添加
-            neighbors[u, deg[u]] = v
-            deg[u] += 1
-
-    # 遍历两个父代，构建完整的邻接图
-    for parent in (p1, p2):
-        for i in range(n):
-            c = parent[i]  # 当前城市
-            add_edge(c, parent[(i - 1) % n])  # 添加左邻居
-            add_edge(c, parent[(i + 1) % n])  # 添加右邻居
-
-    # ERX 构建过程
-    cur = p1[0]  # 从父代1的第一个城市开始
-    next_scan = 0  # 线性扫描指针，用于回退策略
-
-    for t in range(n):
-        child[t] = cur  # 将当前城市加入子代
-        used[cur] = 1   # 标记为已使用
-
-        # 选择下一个城市：优先选择拥有最少可用邻居的邻居
-        best = -1
-        best_score = 1_000_000  # 最小剩余邻居数，初始化为大数
-        
-        # 遍历当前城市的所有邻居
-        for k in range(deg[cur]):
-            nb = neighbors[cur, k]
-            if nb == -1 or used[nb] == 1:  # 跳过无效或已使用的邻居
-                continue
-            
-            # 计算邻居 nb 还有多少未使用的邻居
-            cnt = 0
-            for j in range(deg[nb]):
-                x = neighbors[nb, j]
-                if x != -1 and used[x] == 0:
-                    cnt += 1
-            
-            # 贪婪选择：选择剩余邻居最少的点（减少死胡同概率）
-            if cnt < best_score:
-                best_score = cnt
-                best = nb
-        
-        if best != -1:
-            cur = best  # 找到合适邻居，移动到该城市
-        else:
-            # 死胡同处理：邻居都已使用，线性扫描找一个未使用的城市
-            while next_scan < n and used[next_scan] == 1:
-                next_scan += 1
-            if next_scan < n:
-                cur = next_scan
-            else:
-                # 最后的兜底（理论上不应进入这里，除非逻辑有误）
-                for r in range(n):
-                    if used[r] == 0:
-                        cur = r
-                        break
-    return child  # 返回生成的子代
 
 
 @njit(cache=True, fastmath=True)
@@ -388,121 +312,9 @@ def _or_opt_once_jit(tour, D, block_size):
     return False
 
 
-@njit(cache=True, fastmath=True)
-def double_bridge_move(tour):
-    """
-    Double Bridge (4-Opt) "Kick".
-    将路径切成 4 段 (A, B, C, D) 并重组为 (A, D, C, B)。
-    注意：这是 ATSP 安全的操作，因为它不反转任何片段的方向。
-    """
-    n = len(tour)
-    if n < 4: return tour
-    
-    # 随机选 4 个切点 (需排序)
-    # 使用 np.random.choice 不支持 replace=False 在 numba 中有时会有问题，改用简单的采样
-    # 简单策略: 均匀切分加扰动
-    q = n // 4
-    p1 = 1 + np.random.randint(0, q)
-    p2 = p1 + 1 + np.random.randint(0, q)
-    p3 = p2 + 1 + np.random.randint(0, q)
-    
-    if p3 >= n: p3 = n - 1
-    
-    # 构造新路径: [0...p1] + [p3...end] + [p2...p3] + [p1...p2]
-    # 原序: A(0-p1) B(p1-p2) C(p2-p3) D(p3-end)
-    # 新序: A D C B
-    
-    # 手动拼接以兼容 Numba
-    new_tour = np.empty(n, dtype=tour.dtype)
-    idx = 0
-    
-    # A
-    for i in range(0, p1):
-        new_tour[idx] = tour[i]; idx += 1
-    # D
-    for i in range(p3, n):
-        new_tour[idx] = tour[i]; idx += 1
-    # C
-    for i in range(p2, p3):
-        new_tour[idx] = tour[i]; idx += 1
-    # B
-    for i in range(p1, p2):
-        new_tour[idx] = tour[i]; idx += 1
-        
-    return new_tour
 
-@njit(cache=True, fastmath=True)
-def _swap_segments_jit(tour, D):
-    """
-    尝试交换两个不相邻的片段 (Swap Segments)。
-    这也是 3-Opt 的一种特例，且不反转方向 (ATSP Safe)。
-    """
-    n = tour.shape[0]
-    # 随机选择两个片段 A 和 B
-    # A: [i...i+L1], B: [j...j+L2]
-    # 限制片段长度为 2-4，避免破坏太大
-    L1 = np.random.randint(2, 5)
-    L2 = np.random.randint(2, 5)
-    
-    # 随机起点
-    i = np.random.randint(0, n - L1 - L2 - 2)
-    j = np.random.randint(i + L1 + 1, n - L2)
-    
-    # 边界检查
-    if i + L1 >= j: return False # 重叠
-    
-    # 原始连接:
-    # ... -> [i-1] -> [i...i+L1-1] -> [i+L1] -> ... -> [j-1] -> [j...j+L2-1] -> [j+L2] -> ...
-    #        PreA     BlockA          PostA          PreB     BlockB          PostB
-    
-    PreA = i - 1
-    PostA = i + L1
-    PreB = j - 1
-    PostB = j + L2
-    
-    nodes = tour
-    
-    c_preA = nodes[PreA]; c_startA = nodes[i]; c_endA = nodes[i+L1-1]; c_postA = nodes[PostA]
-    c_preB = nodes[PreB]; c_startB = nodes[j]; c_endB = nodes[j+L2-1]; c_postB = nodes[PostB]
-    
-    # 移除 4 条边: (PreA, StartA), (EndA, PostA), (PreB, StartB), (EndB, PostB)
-    rm_cost = D[c_preA, c_startA] + D[c_endA, c_postA] + D[c_preB, c_startB] + D[c_endB, c_postB]
-    
-    # 增加 4 条边: (PreA, StartB), (EndB, PostA), (PreB, StartA), (EndA, PostB)
-    add_cost = D[c_preA, c_startB] + D[c_endB, c_postA] + D[c_preB, c_startA] + D[c_endA, c_postB]
-    
-    if not np.isfinite(add_cost): return False
-    
-    if add_cost < rm_cost - 1e-6:
-        # 执行交换
-        # 构造新数组比较稳妥
-        new_tour = np.empty_like(tour)
-        idx = 0
-        
-        # 0 ... PreA
-        for k in range(0, i):
-            new_tour[idx] = tour[k]; idx += 1
-            
-        # Block B
-        for k in range(j, j + L2):
-            new_tour[idx] = tour[k]; idx += 1
-            
-        # PostA ... PreB
-        for k in range(i + L1, j):
-            new_tour[idx] = tour[k]; idx += 1
-            
-        # Block A
-        for k in range(i, i + L1):
-            new_tour[idx] = tour[k]; idx += 1
-            
-        # PostB ... End
-        for k in range(j + L2, n):
-            new_tour[idx] = tour[k]; idx += 1
-            
-        tour[:] = new_tour[:]
-        return True
-        
-    return False
+
+
 
 @njit(cache=True, fastmath=True)
 def _candidate_or_opt_jit(tour, D, knn_idx, max_iters=100, dlb_mask=None):
@@ -626,6 +438,50 @@ def _candidate_or_opt_jit(tour, D, knn_idx, max_iters=100, dlb_mask=None):
             break
             
     return improved
+
+
+@njit(cache=True, fastmath=True)
+def double_bridge_move(tour):
+    """
+    Double Bridge (4-Opt) "Kick".
+    将路径切成 4 段 (A, B, C, D) 并重组为 (A, D, C, B)。
+    注意：这是 ATSP 安全的操作，因为它不反转任何片段的方向。
+    """
+    n = len(tour)
+    if n < 4: return tour
+    
+    # 随机选 4 个切点 (需排序)
+    # 使用 np.random.choice 不支持 replace=False 在 numba 中有时会有问题，改用简单的采样
+    # 简单策略: 均匀切分加扰动
+    q = n // 4
+    p1 = 1 + np.random.randint(0, q)
+    p2 = p1 + 1 + np.random.randint(0, q)
+    p3 = p2 + 1 + np.random.randint(0, q)
+    
+    if p3 >= n: p3 = n - 1
+    
+    # 构造新路径: [0...p1] + [p3...end] + [p2...p3] + [p1...p2]
+    # 原序: A(0-p1) B(p1-p2) C(p2-p3) D(p3-end)
+    # 新序: A D C B
+    
+    # 手动拼接以兼容 Numba
+    new_tour = np.empty(n, dtype=tour.dtype)
+    idx = 0
+    
+    # A
+    for i in range(0, p1):
+        new_tour[idx] = tour[i]; idx += 1
+    # D
+    for i in range(p3, n):
+        new_tour[idx] = tour[i]; idx += 1
+    # C
+    for i in range(p2, p3):
+        new_tour[idx] = tour[i]; idx += 1
+    # B
+    for i in range(p1, p2):
+        new_tour[idx] = tour[i]; idx += 1
+        
+    return new_tour
 
 
 @njit(cache=True, fastmath=True)
@@ -1237,7 +1093,7 @@ class r0123456:
             
             # --- C. Local Search (Rehabilitation) ---
             # Deep Polish with DLB
-            _candidate_or_opt_jit(candidate, D, knn_idx, max_iters=500, dlb_mask=dlb_mask)
+            self._vnd_or_opt_inplace(candidate, D, knn_idx, dlb_mask, max_iters=500, block_steps=3)  # VND康复
             cand_fit = tour_length_jit(candidate, D)
             
             # --- D. Acceptance & Trojan Discharge ---
@@ -1245,8 +1101,8 @@ class r0123456:
             
             # 1. Dynamic Tolerance Calculation (Desperation Curve)
             tolerance = 0.0
-            if scout_stagnation > 50: tolerance = 0.02 # 2%
-            if scout_stagnation > 200: tolerance = 0.05 # 5%
+            if scout_stagnation > 50: tolerance = 0.005 # 0.5%
+            if scout_stagnation > 200: tolerance = 0.01 # 1%
             
             # 2. Check for Global Breakthrough or Pilgrim/Trojan
             # We compare against 'patient_entry_fit' (the standard set by Exploiter)
@@ -1273,7 +1129,8 @@ class r0123456:
                 elif is_trojan:
                     if (iter_count - last_send_iter > 200):
                         should_discharge = True
-                        # print(f"[Scout] TROJAN SENT. {cand_fit:.2f} (Tol {tolerance*100:.0f}%)")
+                        if sent_count % 10 == 0: # Log Throttle: only print every 10th Trojan
+                            print(f"[Scout] TROJAN SENT. {cand_fit:.2f} (Tol {tolerance*100:.0f}%)")
                 
                 if should_discharge:
                     try:
@@ -1366,6 +1223,19 @@ class r0123456:
         self._knn_idx = knn_idx  # 保存引用
         print(f"[Island {island_id}] [Init] KNN ready.")
         
+        gls_penalties = np.zeros((n, n), dtype=np.int32)  # GLS惩罚矩阵
+        gls_lambda_scale = 0.03  # GLS权重系数
+        gls_trigger = max(30, int(self.stagnation_limit * 0.6))  # 触发阈值
+        gls_interval = 50  # 更新间隔
+        gls_active = False  # GLS状态
+        D_gls = None  # GLS代价矩阵
+        
+        K_gls = min(n - 1, 64)  # GLS候选K
+        if K_gls > K:  # 需要扩展
+            knn_idx_gls = build_knn_idx(D, finite_mask, K_gls)  # 扩展候选
+        else:  # 不需要扩展
+            knn_idx_gls = knn_idx  # 复用KNN
+        
         # --- DLB Mask Initialization ---
         dlb_mask = np.zeros(n, dtype=np.bool_)
 
@@ -1422,6 +1292,13 @@ class r0123456:
         # ==================== 进化循环 (Evolution Loop: RTR) ====================
         for gen in range(1, self.N_RUNS + 1):
             
+            if gls_active and D_gls is not None:  # GLS模式判断
+                D_ls = D_gls  # 使用惩罚矩阵
+                knn_ls = knn_idx_gls  # 扩大候选
+            else:  # 常规模式
+                D_ls = D  # 使用原矩阵
+                knn_ls = knn_idx  # 使用常规候选
+            
             # --- A. 繁殖 (Reproduction) ---
             # 使用锦标赛选择父代 (Tournament Selection)以增加选择压力
             # RTR 的替换已有压力，但在繁殖端施加压力能加速优良基因的扩散
@@ -1466,7 +1343,7 @@ class r0123456:
                 # 必须为每个个体分别重置 DLB mask，否则上一个体的 bits 会污染下一个
                 dlb_mask[:] = False
                 # 使用 DLB 加速 Or-Opt
-                _candidate_or_opt_jit(c_pop[idx], D, knn_idx, max_iters=self.ls_max_steps, dlb_mask=dlb_mask)
+                self._vnd_or_opt_inplace(c_pop[idx], D_ls, knn_ls, dlb_mask, max_iters=self.ls_max_steps, block_steps=3)  # VND精英LS
             
             for idx in elite_indices:
                 c_fit[idx] = tour_length_jit(c_pop[idx], D)
@@ -1502,7 +1379,7 @@ class r0123456:
                      kick_cand = double_bridge_move(kick_cand)
                      # 踢完简单修复
                      dlb_mask[:] = False
-                     _candidate_or_opt_jit(kick_cand, D, knn_idx, max_iters=50, dlb_mask=dlb_mask)
+                     self._vnd_or_opt_inplace(kick_cand, D_ls, knn_ls, dlb_mask, max_iters=50, block_steps=2)  # VND踢击修补
                      k_fit = tour_length_jit(kick_cand, D)
                      
                      # 替换当前最差
@@ -1551,6 +1428,9 @@ class r0123456:
                         if h_fit < self.best_ever_fitness:
                             self.best_ever_fitness = h_fit
                             self.stagnation_counter = 0 # Reset stagnation
+                            gls_penalties[:] = 0  # 重置惩罚
+                            gls_active = False  # 关闭GLS
+                            D_gls = None  # 清空矩阵
                             print(f"[Exploiter] MIRACLE! Received Healed Solution {h_fit:.2f} (New Best)")
                         else:
                             pass
@@ -1572,6 +1452,9 @@ class r0123456:
             if bestObjective < self.best_ever_fitness:
                 self.best_ever_fitness = bestObjective
                 self.stagnation_counter = 0
+                gls_penalties[:] = 0  # 重置惩罚
+                gls_active = False  # 关闭GLS
+                D_gls = None  # 清空矩阵
                 
                 # New Best! 计算多样性并打印
                 div_dist, div_ent = calc_diversity_metrics_jit(population, population[best_idx])
@@ -1587,6 +1470,16 @@ class r0123456:
                     div_dist, div_ent = calc_diversity_metrics_jit(population, population[best_idx])
                     print(f"Gen {gen:4d} | Best: {bestObjective:.2f} | Div: {div_dist:.1f} | Ent: {div_ent:.3f}")
                     _diversity_computed = True
+            
+            if self.stagnation_counter >= gls_trigger:  # 触发GLS
+                gls_active = True  # 开启GLS
+                if gen % gls_interval == 0:  # 定期更新
+                    self._gls_update_penalties(population[best_idx], D, gls_penalties)  # 更新惩罚
+                    gls_lambda = gls_lambda_scale * (bestObjective / n)  # 更新权重
+                    D_gls = D + gls_lambda * gls_penalties  # 构建GLS矩阵
+                    D_gls = np.ascontiguousarray(D_gls)  # 保证连续
+            else:  # 未触发
+                gls_active = False  # 关闭GLS
             
             # --- Call Reporter (Time Check & CSV Log) ---
             # 必须每代调用，以检查时间并记录 CSV
@@ -1620,7 +1513,7 @@ class r0123456:
                     best_tour_now = population[best_idx].copy()
                     # Deep polish (Use DLB)
                     dlb_mask[:] = False
-                    _candidate_or_opt_jit(best_tour_now, D, knn_idx, max_iters=500, dlb_mask=dlb_mask)
+                    self._vnd_or_opt_inplace(best_tour_now, D, knn_idx, dlb_mask, max_iters=500, block_steps=3)  # VND重启前抛光
                     try:
                         mig_queue.put(best_tour_now, block=True, timeout=1.0)
                         print(f"[Scout] RESTART BEQUEST SENT.")
@@ -1638,6 +1531,9 @@ class r0123456:
                 
                 self.stagnation_counter = 0
                 self.best_ever_fitness = fitness.min()
+                gls_penalties[:] = 0  # 重置惩罚
+                gls_active = False  # 关闭GLS
+                D_gls = None  # 清空矩阵
                 
                 # 重启后强制打印一次
                 print(f"-- Restart Complete. Best kept: {self.best_ever_fitness:.2f} --")
@@ -1703,6 +1599,51 @@ class r0123456:
                 else: # 移到后面
                     tour[i:j] = tour[i+1:j+1]
                     tour[j] = city
+
+    def _vnd_or_opt_inplace(self, tour: np.ndarray, D: np.ndarray, knn_idx: np.ndarray, dlb_mask: np.ndarray, max_iters: int, block_steps: int):  # VND局部搜索
+        max_iters = int(max_iters)  # 迭代步数
+        block_steps = int(block_steps)  # 块步数
+        if block_steps < 1:  # 保底判断
+            block_steps = 1  # 最少一次
+        improved = True  # 改进标记
+        while improved:  # 持续搜索
+            improved = False  # 先设为未改进
+            dlb_mask[:] = False  # 重置DLB
+            if _candidate_or_opt_jit(tour, D, knn_idx, max_iters=max_iters, dlb_mask=dlb_mask):  # k=1
+                improved = True  # 标记改进
+                continue  # 回到k=1
+            for _ in range(block_steps):  # 尝试块长2
+                if _or_opt_once_jit(tour, D, 2):  # k=2
+                    improved = True  # 标记改进
+                    break  # 结束本层
+            if improved:  # 若已改进
+                continue  # 回到k=1
+            for _ in range(block_steps):  # 尝试块长3
+                if _or_opt_once_jit(tour, D, 3):  # k=3
+                    improved = True  # 标记改进
+                    break  # 结束本层
+
+    def _gls_update_penalties(self, tour: np.ndarray, D: np.ndarray, penalties: np.ndarray):  # GLS惩罚更新
+        n = tour.shape[0]  # 城市数
+        max_util = -1.0  # 最大效用
+        for i in range(n):  # 遍历边
+            a = tour[i]  # 起点
+            b = tour[(i + 1) % n]  # 终点
+            if not np.isfinite(D[a, b]):  # 不可行边
+                continue  # 跳过
+            util = D[a, b] / (1.0 + penalties[a, b])  # 计算效用
+            if util > max_util:  # 更新最大值
+                max_util = util  # 保存最大值
+        if max_util < 0.0:  # 无有效边
+            return  # 直接返回
+        for i in range(n):  # 再次遍历
+            a = tour[i]  # 起点
+            b = tour[(i + 1) % n]  # 终点
+            if not np.isfinite(D[a, b]):  # 不可行边
+                continue  # 跳过
+            util = D[a, b] / (1.0 + penalties[a, b])  # 计算效用
+            if util >= max_util - 1e-12:  # 选中最大边
+                penalties[a, b] += 1  # 增加惩罚
 
     def _light_two_opt_inplace(self, tour: np.ndarray, D: np.ndarray, finite_mask: np.ndarray, max_steps: int):
         """调用 JIT 版局部搜索 (混合 2-opt 和 Or-opt)"""
