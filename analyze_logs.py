@@ -16,7 +16,7 @@ def load_logs(island_0_log, island_1_log):
     df1['island'] = 1
     return df0, df1
 
-def plot_convergence(df0, df1, output_file='convergence.png'):
+def plot_convergence(df0, df1, output_file='convergence.png', problem_name=None):
     """绘制收敛曲线对比图"""
     fig, ax1 = plt.subplots(figsize=(12, 6))
     ax2 = ax1.twiny()
@@ -37,7 +37,10 @@ def plot_convergence(df0, df1, output_file='convergence.png'):
     ax1.set_xlabel('Exploiter Generation')
     ax2.set_xlabel('Scout Iteration (LNS Steps)')
     ax1.set_ylabel('Best Fitness')
-    ax1.set_title('Convergence Comparison: Exploiter vs Scout (Dual X-Axis)')
+    title = 'Convergence Comparison: Exploiter vs Scout (Dual X-Axis)'  # 标题模板
+    if problem_name:  # 追加问题名
+        title = f'{problem_name} | {title}'  # 拼接标题
+    ax1.set_title(title)
     
     # Combined Legend
     lines = [l1, l2, l3]
@@ -56,7 +59,7 @@ def plot_convergence(df0, df1, output_file='convergence.png'):
     print(f"[Saved] {output_file}")
     return fig
 
-def plot_diversity(df0, df1, output_file='diversity.png'):
+def plot_diversity(df0, df1, output_file='diversity.png', problem_name=None):
     """绘制多样性变化图 (Dual X-Axis)"""
     fig, axes = plt.subplots(2, 1, figsize=(12, 8), sharex=False)
     
@@ -72,7 +75,10 @@ def plot_diversity(df0, df1, output_file='diversity.png'):
     ax1.set_ylabel('Avg Bond Distance')
     ax1.set_xlabel('Exploiter Gen')
     ax1b.set_xlabel('Scout Iter')
-    ax1.set_title('Diversity Metrics (Bond Distance)')
+    title1 = 'Diversity Metrics (Bond Distance)'  # 标题模板
+    if problem_name:  # 追加问题名
+        title1 = f'{problem_name} | {title1}'  # 拼接标题
+    ax1.set_title(title1)
     
     # Legend
     lines = [l1, l2]
@@ -101,7 +107,7 @@ def plot_diversity(df0, df1, output_file='diversity.png'):
     print(f"[Saved] {output_file}")
     return fig
 
-def plot_events(df0, df1, output_file='events.png'):
+def plot_events(df0, df1, output_file='events.png', problem_name=None):
     """绘制事件时间线 (RTR接受率 + 迁移事件) - Independent X Axes"""
     fig, axes = plt.subplots(3, 1, figsize=(12, 12), sharex=False)
     
@@ -119,7 +125,10 @@ def plot_events(df0, df1, output_file='events.png'):
     l2, = ax1b.plot(df1['gen'], df1['rtr_rate'], label='Scout RTR Rate', alpha=0.7, color='green', linestyle='--')
     
     ax1.set_ylabel(f'RTR Accepts (rolling {window})')
-    ax1.set_title('Selection Pressure (Exploiter vs Scout)')
+    title1 = 'Selection Pressure (Exploiter vs Scout)'  # 标题模板
+    if problem_name:  # 追加问题名
+        title1 = f'{problem_name} | {title1}'  # 拼接标题
+    ax1.set_title(title1)
     ax1.set_xlabel('Exploiter Gen')
     ax1b.set_xlabel('Scout Iter')
     
@@ -146,7 +155,10 @@ def plot_events(df0, df1, output_file='events.png'):
                        
     ax2.set_ylabel('Events')
     ax2.set_xlabel('Scout Iteration (LNS Steps)')
-    ax2.set_title('Trauma Center Activity (Red=In, Green=Out)')
+    title2 = 'Trauma Center Activity (Red=In, Green=Out)'  # 标题模板
+    if problem_name:  # 追加问题名
+        title2 = f'{problem_name} | {title2}'  # 拼接标题
+    ax2.set_title(title2)
     ax2.set_yticks([])
     ax2.legend()
     ax2.grid(True, alpha=0.3)
@@ -165,7 +177,10 @@ def plot_events(df0, df1, output_file='events.png'):
     ax3.plot(df0['gen'], df0['best_fit'], label='Exploiter Fitness', alpha=0.5, color='blue')
     ax3.set_ylabel('Fitness')
     ax3.set_xlabel('Exploiter Generation')
-    ax3.set_title('Exploiter Reception & Fitness Impact')
+    title3 = 'Exploiter Reception & Fitness Impact'  # 标题模板
+    if problem_name:  # 追加问题名
+        title3 = f'{problem_name} | {title3}'  # 拼接标题
+    ax3.set_title(title3)
     
     # Zoom in Y-axis
     min_fit = df0['best_fit'].min()
@@ -182,7 +197,7 @@ def plot_events(df0, df1, output_file='events.png'):
     print(f"[Saved] {output_file}")
     return fig
 
-def plot_stagnation(df0, df1, output_file='stagnation.png'):
+def plot_stagnation(df0, df1, output_file='stagnation.png', problem_name=None):
     """绘制停滞计数曲线 (Dual X-Axis)"""
     fig, ax1 = plt.subplots(figsize=(12, 5))
     ax2 = ax1.twiny()
@@ -196,7 +211,10 @@ def plot_stagnation(df0, df1, output_file='stagnation.png'):
     ax1.set_xlabel('Exploiter Generation')
     ax2.set_xlabel('Scout Iteration')
     ax1.set_ylabel('Stagnation Counter')
-    ax1.set_title('Stagnation Counter (Exploiter vs Scout)')
+    title = 'Stagnation Counter (Exploiter vs Scout)'  # 标题模板
+    if problem_name:  # 追加问题名
+        title = f'{problem_name} | {title}'  # 拼接标题
+    ax1.set_title(title)
     
     lines = [l1, l2]
     ax1.legend(lines, [l.get_label() for l in lines], loc='upper right')
@@ -206,6 +224,95 @@ def plot_stagnation(df0, df1, output_file='stagnation.png'):
     plt.savefig(output_file, dpi=150)
     print(f"[Saved] {output_file}")
     return fig
+
+
+def _compute_stagnation_lengths(stag_series):  # 停滞段
+    """计算连续停滞段长度"""
+    lengths = []  # 结果列表
+    current = 0  # 当前长度
+    for v in stag_series:  # 遍历序列
+        if v <= 0:  # 停滞重置
+            if current > 0:  # 有段落
+                lengths.append(current)  # 记录
+                current = 0  # 清零
+        else:  # 停滞继续
+            current += 1  # 累加
+    if current > 0:  # 收尾
+        lengths.append(current)  # 记录
+    return lengths  # 返回结果
+
+
+def _compute_migration_gain(df, window):  # 迁移收益
+    """计算迁移后改进幅度"""
+    gains = []  # 改进列表
+    positions = df.index[df['migration'] == 1].to_numpy()  # 迁移位置
+    if positions.size == 0:  # 无事件
+        return gains  # 直接返回
+    for pos in positions:  # 遍历事件
+        base = float(df.at[pos, 'best_fit'])  # 事件时基准
+        end = min(pos + window, len(df) - 1)  # 窗口终点
+        after_min = float(df.loc[pos:end, 'best_fit'].min())  # 窗口最优
+        gains.append(base - after_min)  # 改进幅度
+    return gains  # 返回结果
+
+
+def _compute_spike_ratio(series, quantile=0.9):  # 尖峰比例
+    """计算尖峰比例"""
+    values = series[series > 0]  # 过滤无效
+    if len(values) == 0:  # 无有效值
+        return 0.0, 0.0, 0, 0  # 返回空值
+    threshold = float(values.quantile(quantile))  # 尖峰阈值
+    spike_count = int((values >= threshold).sum())  # 尖峰数量
+    total_count = int(values.shape[0])  # 总数
+    ratio = spike_count / total_count  # 比例
+    return ratio, threshold, spike_count, total_count  # 返回结果
+
+
+def plot_diagnostics(df0, df1, output_file='diagnostics.png', problem_name=None):  # 诊断图
+    """绘制额外诊断指标"""
+    fig, axes = plt.subplots(3, 1, figsize=(12, 10), sharex=False)  # 画布
+    window = 50  # 平滑窗口
+    
+    best_delta = df0['best_fit'].diff()  # 最优差分
+    delta_roll = best_delta.rolling(window).mean()  # 差分平滑
+    improve_rate = (best_delta < 0).rolling(window).mean()  # 改进率
+    gap = df0['mean_fit'] - df0['best_fit']  # 群体差距
+    
+    ax1 = axes[0]  # 子图1
+    ax1.plot(df0['gen'], -delta_roll, color='blue', alpha=0.8)  # 改进幅度
+    title1 = 'Improvement Magnitude (Rolling)'  # 标题模板
+    if problem_name:  # 追加问题名
+        title1 = f'{problem_name} | {title1}'  # 拼接标题
+    ax1.set_title(title1)  # 标题
+    ax1.set_ylabel('Avg Improvement')  # 纵轴
+    ax1.set_xlabel('Exploiter Gen')  # 横轴
+    ax1.grid(True, alpha=0.3)  # 网格
+    
+    ax2 = axes[1]  # 子图2
+    ax2.plot(df0['gen'], gap, color='purple', alpha=0.8)  # 群体差距
+    title2 = 'Population Gap (Mean - Best)'  # 标题模板
+    if problem_name:  # 追加问题名
+        title2 = f'{problem_name} | {title2}'  # 拼接标题
+    ax2.set_title(title2)  # 标题
+    ax2.set_ylabel('Gap')  # 纵轴
+    ax2.set_xlabel('Exploiter Gen')  # 横轴
+    ax2.grid(True, alpha=0.3)  # 网格
+    
+    ax3 = axes[2]  # 子图3
+    ax3.plot(df0['gen'], improve_rate, color='green', alpha=0.8)  # 改进频率
+    title3 = 'Improvement Rate (Rolling)'  # 标题模板
+    if problem_name:  # 追加问题名
+        title3 = f'{problem_name} | {title3}'  # 拼接标题
+    ax3.set_title(title3)  # 标题
+    ax3.set_ylabel('Rate')  # 纵轴
+    ax3.set_xlabel('Exploiter Gen')  # 横轴
+    ax3.set_ylim(0, 1)  # 固定范围
+    ax3.grid(True, alpha=0.3)  # 网格
+    
+    plt.tight_layout()  # 紧凑布局
+    plt.savefig(output_file, dpi=150)  # 保存图片
+    print(f"[Saved] {output_file}")  # 输出提示
+    return fig  # 返回图像
 
 
 def print_summary(df0, df1):
@@ -220,6 +327,51 @@ def print_summary(df0, df1):
     print(f"  Scout Seeds Absorbed: {df0['migration'].sum()}")
     print(f"  Avg RTR Acceptance: {df0['rtr_accepts'].mean():.2f}")
     
+    best_delta = df0['best_fit'].diff()  # 最优差分
+    improve_mask = best_delta < 0  # 改进标记
+    improve_ratio = float(improve_mask.mean())  # 改进比例
+    improve_vals = (-best_delta[improve_mask])  # 改进幅度
+    improve_mean = float(improve_vals.mean()) if len(improve_vals) > 0 else 0.0  # 平均改进
+    gap = df0['mean_fit'] - df0['best_fit']  # 群体差距
+    gap_mean = float(gap.mean())  # 平均差距
+    gap_last = float(gap.iloc[-1])  # 末尾差距
+    
+    tail_start = int(len(df0) * 0.6)  # 尾段起点
+    tail_ratio = float((best_delta.iloc[tail_start:] < 0).mean()) if len(df0) > 1 else 0.0  # 尾段改进率
+    
+    stag_lengths = _compute_stagnation_lengths(df0['stagnation'])  # 停滞段
+    stag_mean = float(np.mean(stag_lengths)) if len(stag_lengths) > 0 else 0.0  # 平均长度
+    stag_max = int(np.max(stag_lengths)) if len(stag_lengths) > 0 else 0  # 最大长度
+    
+    div_ratio, div_thr, div_cnt, div_tot = _compute_spike_ratio(df0['diversity'])  # 多样性尖峰
+    ent_ratio, ent_thr, ent_cnt, ent_tot = _compute_spike_ratio(df0['entropy'])  # 熵尖峰
+    
+    mig_gain_10 = _compute_migration_gain(df0, 10)  # 迁移收益10
+    mig_gain_20 = _compute_migration_gain(df0, 20)  # 迁移收益20
+    mig_mean_10 = float(np.mean(mig_gain_10)) if len(mig_gain_10) > 0 else 0.0  # 平均收益10
+    mig_mean_20 = float(np.mean(mig_gain_20)) if len(mig_gain_20) > 0 else 0.0  # 平均收益20
+    mig_pos_10 = float(np.mean(np.array(mig_gain_10) > 0)) if len(mig_gain_10) > 0 else 0.0  # 正收益率10
+    mig_pos_20 = float(np.mean(np.array(mig_gain_20) > 0)) if len(mig_gain_20) > 0 else 0.0  # 正收益率20
+    
+    rtr_roll = df0['rtr_accepts'].rolling(50).mean().dropna()  # RTR平滑
+    if len(rtr_roll) > 0:  # 有效数据
+        head_len = max(1, int(len(rtr_roll) * 0.33))  # 前段长度
+        tail_len = max(1, int(len(rtr_roll) * 0.33))  # 后段长度
+        rtr_head = float(rtr_roll.iloc[:head_len].mean())  # 前段均值
+        rtr_tail = float(rtr_roll.iloc[-tail_len:].mean())  # 后段均值
+    else:  # 无数据
+        rtr_head = 0.0  # 前段默认
+        rtr_tail = 0.0  # 后段默认
+    
+    print(f"  Improve Rate: {improve_ratio:.2%} | Avg Gain: {improve_mean:.2f}")  # 改进统计
+    print(f"  Gap Mean/Last: {gap_mean:.2f} / {gap_last:.2f}")  # 群体差距
+    print(f"  Tail Improve Rate (last 40%): {tail_ratio:.2%}")  # 尾段改进
+    print(f"  Stag Episode Len (mean/max): {stag_mean:.1f} / {stag_max}")  # 停滞段
+    print(f"  Diversity Spikes: {div_cnt}/{div_tot} ({div_ratio:.1%}) Thr={div_thr:.1f}")  # 多样性尖峰
+    print(f"  Entropy Spikes: {ent_cnt}/{ent_tot} ({ent_ratio:.1%}) Thr={ent_thr:.1f}")  # 熵尖峰
+    print(f"  Migration Gain(10/20): {mig_mean_10:.2f}/{mig_mean_20:.2f} | PosRate {mig_pos_10:.1%}/{mig_pos_20:.1%}")  # 迁移收益
+    print(f"  RTR Trend (head->tail): {rtr_head:.2f} -> {rtr_tail:.2f}")  # 选择压力
+    
     print(f"\n[Island 1 - Scout (The Scout)]")
     print(f"  Generations: {df1['gen'].max()}")
     print(f"  Best Fitness (Local): {df1['best_fit'].min():.4f}")
@@ -229,6 +381,7 @@ def print_summary(df0, df1):
     restarts = (stag_diff < -10).sum()
     print(f"  Resets/Sends Triggered: {restarts}")
     print(f"  Avg RTR Acceptance: {df1['rtr_accepts'].mean():.2f}")
+    print(f"  Admissions/Discharges: {df1['migration'].sum()} / {df1['repulsion'].sum()}")  # 收治与出院
     
     overall_best = min(df0['best_fit'].min(), df1['best_fit'].min())
     print(f"\n[Overall Performance]")
@@ -240,7 +393,7 @@ def main():
     # 用户配置区域：只需要填入日志文件夹路径
     # ==============================================================================
     
-    LOG_FOLDER = "logs_20251219_114515"  # 填入日志文件夹名称
+    LOG_FOLDER = "logs_20251219_155442"  # 填入日志文件夹名称
     
     # ==============================================================================
     
@@ -284,10 +437,11 @@ def main():
         prefix = os.path.join(LOG_FOLDER, f"{problem}_")
         
         # 生成图表
-        plot_convergence(df0, df1, f"{prefix}convergence.png")
-        plot_diversity(df0, df1, f"{prefix}diversity.png")
-        plot_events(df0, df1, f"{prefix}events.png")
-        plot_stagnation(df0, df1, f"{prefix}stagnation.png")
+        plot_convergence(df0, df1, f"{prefix}convergence.png", problem)  # 收敛图
+        plot_diversity(df0, df1, f"{prefix}diversity.png", problem)  # 多样性图
+        plot_events(df0, df1, f"{prefix}events.png", problem)  # 事件图
+        plot_stagnation(df0, df1, f"{prefix}stagnation.png", problem)  # 停滞图
+        plot_diagnostics(df0, df1, f"{prefix}diagnostics.png", problem)  # 诊断图
         
         # 打印摘要
         print_summary(df0, df1)

@@ -317,129 +317,143 @@ def _or_opt_once_jit(tour, D, block_size):
 
 
 @njit(cache=True, fastmath=True)
-def _candidate_or_opt_jit(tour, D, knn_idx, max_iters=100, dlb_mask=None):
+def _candidate_or_opt_jit(tour, D, knn_idx, max_iters=100, dlb_mask=None, block_size=1):
     """
-    P1: 候选列表驱动的 Or-Opt 局部搜索，集成 DLB 加速。
-    
-    Args:
-        dlb_mask: Boolean array for Don't Look Bits. If None, it's ignored.
-                  True means 'Don't Look' (Skip).
+    P1: ??????? Or-Opt/Block-Or-Opt??? DLB ???
     """
-    n = tour.shape[0]
-    K = knn_idx.shape[1]
+    n = tour.shape[0]  # ???
+    K = knn_idx.shape[1]  # ???
+    block_size = int(block_size)  # ???
+    if block_size < 1:  # ????
+        block_size = 1  # ??
+    if block_size >= n:  # ????
+        return False  # ????
     
-    # 构建位置索引
-    pos = np.empty(n, np.int32)
-    for i in range(n):
-        pos[tour[i]] = i
+    pos = np.empty(n, np.int32)  # ???
+    for i in range(n):  # ??
+        pos[tour[i]] = i  # ??
     
-    improved = False
+    improved = False  # ????
+    use_dlb = (dlb_mask is not None)  # DLB??
     
-    # 如果没传 DLB，就临时建一个全 False 的（全检查）
-    use_dlb = (dlb_mask is not None)
-    
-    for _ in range(max_iters):
-        found_in_try = False
+    for _ in range(max_iters):  # ????
+        found_in_try = False  # ????
+        start = np.random.randint(0, n)  # ????
         
-        # 随机遍历顺序
-        # 为了 DLB 有效，最好不要完全随机跳，而是有序遍历或随机偏移
-        start = np.random.randint(0, n)
-        
-        for offset in range(n):
-            u_idx = (start + offset) % n
-            u = tour[u_idx]
+        for offset in range(n):  # ????
+            u_idx = (start + offset) % n  # ????
+            u = tour[u_idx]  # ????
             
-            # DLB Check
-            if use_dlb and dlb_mask[u]:
-                continue
+            if use_dlb and dlb_mask[u]:  # DLB??
+                continue  # ??
                 
-            prev_u = tour[(u_idx - 1) % n]
-            next_u = tour[(u_idx + 1) % n]
+            if block_size > 1 and u_idx + block_size >= n:  # ????
+                if use_dlb:  # DLB??
+                    dlb_mask[u] = True  # ????
+                continue  # ??
             
-            remove_cost = D[prev_u, u] + D[u, next_u]
-            new_edge_cost = D[prev_u, next_u]
+            prev_idx = u_idx - 1  # ????
+            if prev_idx < 0:  # ????
+                prev_idx = n - 1  # ????
+                
+            post_idx = u_idx + block_size  # ????
+            if post_idx >= n:  # ????
+                post_idx = 0  # ????
             
-            if not np.isfinite(new_edge_cost): continue
+            prev_u = tour[prev_idx]  # ????
+            block_head = u  # ????
+            block_tail = tour[u_idx + block_size - 1]  # ????
+            next_after = tour[post_idx]  # ????
             
-            move_found = False
+            if not np.isfinite(D[prev_u, block_head]):  # ???
+                continue  # ??
+            if not np.isfinite(D[block_tail, next_after]):  # ???
+                continue  # ??
+            if not np.isfinite(D[prev_u, next_after]):  # ???
+                continue  # ??
             
-            # 搜索 KNN
-            for k in range(K):
-                target = knn_idx[u, k]
-                if target == -1: break
-                
-                # 检查 target 是否在 DLB (Strict 模式: 如果 target 也没变过，也许不用插? 
-                # 但通常只检查起点 u。这里不检查 target 的 DLB)
-
-                t_idx = pos[target]
-                next_t = tour[(t_idx + 1) % n]
-                
-                if target == u or next_t == u or target == prev_u: continue
-                
-                insert_cost = D[target, u] + D[u, next_t]
-                old_edge_cost = D[target, next_t]
-                
-                if not np.isfinite(insert_cost): continue
-                
-                gain = (remove_cost - new_edge_cost) + (old_edge_cost - insert_cost)
-                
-                if gain > 1e-6:
-                    # Apply Move
-                    # ... (Move Logic same as before) ...
-                    # 简化：因为 Python loop 还是慢，这里用切片逻辑如果能在 numba 里跑最好
-                    # 手动移动:
-                    
-                    # 0. 备份受影响的点，用于解锁 DLB
-                    affected = [prev_u, next_u, target, next_t, u]
-                    
-                    # 1. 删除 u
-                    temp_tour = np.empty(n - 1, dtype=tour.dtype)
-                    if u_idx > 0:
-                        temp_tour[:u_idx] = tour[:u_idx]
-                        temp_tour[u_idx:] = tour[u_idx+1:]
-                    else:
-                        temp_tour[:] = tour[1:]
-                        
-                    # 2. 找到 target 在 temp 中的位置
-                    # 如果 target 在 u 后面，它的索引减了 1
-                    t_idx_new = t_idx
-                    if t_idx > u_idx: t_idx_new -= 1
-                    
-                    # 3. 在 target (t_idx_new) 后面插入 u
-                    # new tour len = n
-                    # [0 ... t_idx_new] + [u] + [t_idx_new+1 ... end]
-                    
-                    tour[:t_idx_new+1] = temp_tour[:t_idx_new+1]
-                    tour[t_idx_new+1] = u
-                    tour[t_idx_new+2:] = temp_tour[t_idx_new+1:]
-                    
-                    # Rebuild pos (Slow? incremental update is better but complex)
-                    for i in range(n): pos[tour[i]] = i
-                    
-                    move_found = True
-                    improved = True
-                    
-                    # Unlock DLB for affected cities
-                    if use_dlb:
-                        for ac in affected:
-                            dlb_mask[ac] = False
-                            
-                    break # Break KNN loop
+            remove_cost = D[prev_u, block_head] + D[block_tail, next_after]  # ????
+            new_edge_cost = D[prev_u, next_after]  # ?????
+            move_found = False  # ????
             
-            if move_found:
-                found_in_try = True
-            else:
-                # 只有当彻底搜索了所有邻居都没找到移动，才 Lock u
-                if use_dlb:
-                    dlb_mask[u] = True
+            for k in range(K):  # ????
+                target = knn_idx[block_head, k]  # ????
+                if target == -1:  # ????
+                    break  # ??
+                
+                t_idx = pos[target]  # ????
+                if t_idx == prev_idx:  # ?????
+                    continue  # ??
+                if t_idx >= u_idx and t_idx < u_idx + block_size:  # ???
+                    continue  # ??
                     
-        if not found_in_try and use_dlb:
-            # 如果一整圈都没动静，说明陷入极值，直接退出
-            break
+                next_t = tour[(t_idx + 1) % n]  # ????
+                
+                if not np.isfinite(D[target, next_t]):  # ???
+                    continue  # ??
+                if not np.isfinite(D[target, block_head]):  # ???
+                    continue  # ??
+                if not np.isfinite(D[block_tail, next_t]):  # ???
+                    continue  # ??
+                
+                insert_cost = D[target, block_head] + D[block_tail, next_t]  # ????
+                old_edge_cost = D[target, next_t]  # ????
+                gain = (remove_cost - new_edge_cost) + (old_edge_cost - insert_cost)  # ???
+                
+                if gain > 1e-6:  # ???
+                    block = np.empty(block_size, dtype=tour.dtype)  # ???
+                    for b in range(block_size):  # ???
+                        block[b] = tour[u_idx + b]  # ??
+                    
+                    temp_len = n - block_size  # ????
+                    temp_tour = np.empty(temp_len, dtype=tour.dtype)  # ????
+                    if u_idx > 0:  # ???
+                        temp_tour[:u_idx] = tour[:u_idx]  # ????
+                    if u_idx + block_size < n:  # ???
+                        temp_tour[u_idx:] = tour[u_idx + block_size:]  # ????
+                    
+                    t_idx_new = t_idx  # ???
+                    if t_idx > u_idx:  # ????
+                        t_idx_new -= block_size  # ????
+                    
+                    new_tour = np.empty(n, dtype=tour.dtype)  # ???
+                    idx = 0  # ????
+                    for i in range(temp_len):  # ????
+                        new_tour[idx] = temp_tour[i]  # ????
+                        idx += 1  # ????
+                        if i == t_idx_new:  # ???
+                            for b in range(block_size):  # ???
+                                new_tour[idx] = block[b]  # ???
+                                idx += 1  # ????
+                    
+                    tour[:] = new_tour[:]  # ????
+                    for i in range(n):  # ????
+                        pos[tour[i]] = i  # ????
+                    
+                    improved = True  # ????
+                    move_found = True  # ????
+                    found_in_try = True  # ????
+                    
+                    if use_dlb:  # ??DLB
+                        dlb_mask[prev_u] = False  # ??
+                        dlb_mask[next_after] = False  # ??
+                        dlb_mask[target] = False  # ??
+                        dlb_mask[next_t] = False  # ????
+                        for b in range(block_size):  # ??
+                            dlb_mask[block[b]] = False  # ??
+                    
+                    break  # ????
+            
+            if move_found:  # ????
+                continue  # ????
+            else:  # ???
+                if use_dlb:  # DLB??
+                    dlb_mask[block_head] = True  # ??
+                    
+        if not found_in_try and use_dlb:  # ?????
+            break  # ??
             
     return improved
-
-
 @njit(cache=True, fastmath=True)
 def double_bridge_move(tour):
     """
@@ -800,6 +814,128 @@ def _bfs_ruin_mask_jit(n, knn_idx, n_remove):
 
 
 @njit(cache=True, nogil=True)
+def _insert_city_jit(current_tour, city, pos):
+    """
+    插入城市到指定位置 (ATSP 安全)。
+    """
+    m = len(current_tour)  # 当前长度
+    new_tour = np.empty(m + 1, dtype=np.int32)  # 新数组
+    new_tour[:pos+1] = current_tour[:pos+1]  # 前半拷贝
+    new_tour[pos+1] = city  # 插入城市
+    new_tour[pos+2:] = current_tour[pos+1:]  # 后半拷贝
+    return new_tour  # 返回结果
+
+
+@njit(cache=True, nogil=True)
+def _best_two_positions_jit(city, current_tour, D):
+    """
+    计算最佳与次佳插入位置 (Regret 需要)。
+    """
+    best_delta = 1e20  # 最小代价
+    second_delta = 1e20  # 次小代价
+    best_pos = -1  # 最佳位置
+    m = len(current_tour)  # 当前长度
+    for i in range(m):  # 遍历边
+        u = current_tour[i]  # 左端
+        v = current_tour[(i + 1) % m]  # 右端
+        delta = D[u, city] + D[city, v] - D[u, v]  # 插入增量
+        if delta < best_delta:  # 更优
+            second_delta = best_delta  # 下移
+            best_delta = delta  # 更新
+            best_pos = i  # 记录
+        elif delta < second_delta:  # 次优
+            second_delta = delta  # 更新
+    return best_delta, second_delta, best_pos  # 返回结果
+
+
+@njit(cache=True, nogil=True)
+def _ruin_and_recreate_regret_jit(tour: np.ndarray, D: np.ndarray, ruin_pct: float,
+                                  knn_idx: np.ndarray, regret_frac: float,
+                                  regret_sample: int, regret_min_remove: int) -> np.ndarray:
+    """
+    Ruin & Recreate + Regret-lite (KNN Ruin, 混合重建)。
+    """
+    n = len(tour)  # 城市数
+    n_remove = int(n * ruin_pct)  # 移除数
+    if n_remove < 2:  # 太少直接返回
+        return tour.copy()
+    
+    kept_cities = np.empty(n - n_remove, dtype=np.int32)  # 保留列表
+    removed_cities = np.empty(n_remove, dtype=np.int32)  # 移除列表
+    
+    # --- Ruin: BFS-KNN Radial ---
+    mask = _bfs_ruin_mask_jit(n, knn_idx, n_remove)  # 生成掩码
+    k_ptr = 0  # 保留指针
+    r_ptr = 0  # 移除指针
+    for i in range(n):  # 遍历路径
+        c = tour[i]  # 当前城市
+        if mask[c]:  # 被移除
+            if r_ptr < n_remove:  # 防溢出
+                removed_cities[r_ptr] = c  # 记录
+                r_ptr += 1  # 前进
+        else:  # 保留
+            if k_ptr < n - n_remove:  # 防溢出
+                kept_cities[k_ptr] = c  # 记录
+                k_ptr += 1  # 前进
+    
+    current_tour = kept_cities  # 当前解
+    np.random.shuffle(removed_cities)  # 打散顺序
+    r_len = n_remove  # 剩余数量
+    
+    # --- Regret-lite Phase ---
+    use_regret = (n_remove >= regret_min_remove) and (regret_frac > 0.0) and (regret_sample > 0)  # 条件
+    if use_regret:  # 启用
+        regret_steps = int(r_len * regret_frac)  # 阶段长度
+        if regret_steps < 1:  # 至少一次
+            regret_steps = 1  # 兜底
+        for _ in range(regret_steps):  # 循环插入
+            if r_len <= 0:  # 无元素
+                break  # 结束
+            sample = regret_sample if regret_sample < r_len else r_len  # 抽样数
+            best_regret = -1.0  # 最大后悔值
+            best_delta = 1e20  # 对应代价
+            best_pos = -1  # 最佳位置
+            best_idx = -1  # 最佳索引
+            for _ in range(sample):  # 抽样城市
+                pick_idx = np.random.randint(0, r_len)  # 随机索引
+                city = removed_cities[pick_idx]  # 取城市
+                d1, d2, pos = _best_two_positions_jit(city, current_tour, D)  # 计算
+                regret = d2 - d1  # 后悔值
+                if regret > best_regret:  # 更新最大
+                    best_regret = regret  # 记录
+                    best_delta = d1  # 记录
+                    best_pos = pos  # 记录
+                    best_idx = pick_idx  # 记录
+                elif regret == best_regret and d1 < best_delta:  # 次规则
+                    best_delta = d1  # 更新
+                    best_pos = pos  # 更新
+                    best_idx = pick_idx  # 更新
+            if best_idx == -1:  # 无候选
+                break  # 退出
+            city = removed_cities[best_idx]  # 选中城市
+            current_tour = _insert_city_jit(current_tour, city, best_pos)  # 插入
+            r_len -= 1  # 缩短
+            removed_cities[best_idx] = removed_cities[r_len]  # 覆盖
+    
+    # --- Cheapest Insertion Phase ---
+    for i in range(r_len):  # 遍历剩余
+        city = removed_cities[i]  # 当前城市
+        best_delta = 1e20  # 最小代价
+        best_pos = -1  # 最佳位置
+        m = len(current_tour)  # 当前长度
+        for j in range(m):  # 遍历边
+            u = current_tour[j]  # 左端
+            v = current_tour[(j + 1) % m]  # 右端
+            delta = D[u, city] + D[city, v] - D[u, v]  # 插入代价
+            if delta < best_delta:  # 更新
+                best_delta = delta  # 记录
+                best_pos = j  # 记录
+        current_tour = _insert_city_jit(current_tour, city, best_pos)  # 插入
+    
+    return current_tour  # 返回结果
+
+
+@njit(cache=True, nogil=True)
 def _ruin_and_recreate_jit(tour: np.ndarray, D: np.ndarray, ruin_pct: float, knn_idx: np.ndarray = None) -> np.ndarray:
     """
     Ruin & Recreate (LNS Operator) - ATSP Optimized
@@ -972,6 +1108,11 @@ class r0123456:
                  local_rate: float = 0.2,     # 局部搜索概率
                  ls_max_steps: int = 30,      # 局部搜索最大步数
                  stagnation_limit: int = 150, # 停滞阈值（用于灾变）
+                 regret_frac: float = 0.25,   # Regret-lite 比例
+                 regret_sample: int = 8,      # Regret-lite 抽样数
+                 regret_trigger: int = 80,    # Regret-lite 触发阈值
+                 regret_min_remove: int = 30, # Regret-lite 最小移除
+                 regret_enabled: bool = True, # Regret-lite 开关
                  log_file: Optional[str] = None):  # 诊断日志文件路径
         
         self.reporter = Reporter.Reporter(self.__class__.__name__)
@@ -986,6 +1127,11 @@ class r0123456:
         self.local_rate = float(local_rate)
         self.ls_max_steps = int(ls_max_steps)
         self.stagnation_limit = int(stagnation_limit)
+        self.regret_frac = float(regret_frac)  # 保存比例
+        self.regret_sample = int(regret_sample)  # 保存抽样数
+        self.regret_trigger = int(regret_trigger)  # 保存阈值
+        self.regret_min_remove = int(regret_min_remove)  # 保存下限
+        self.regret_enabled = bool(regret_enabled)  # 保存开关
         
         # 停滞检测状态
         self.best_ever_fitness = np.inf
@@ -1085,8 +1231,26 @@ class r0123456:
             gear_idx = int((iter_count - last_improv_iter) // 250) % 6
             ruin_pct = ruin_gears[gear_idx]
             
-            # Use BFS-KNN Radial Ruin
-            candidate = _ruin_and_recreate_jit(current_tour, D, ruin_pct, knn_idx)
+            # Regret-lite 条件判断
+            use_regret = self.regret_enabled and (scout_stagnation >= self.regret_trigger)  # 触发条件
+            
+            # Regret-lite 强度自适应
+            if use_regret:  # 需要增强
+                denom = self.stagnation_limit - self.regret_trigger  # 分母
+                if denom < 1:  # 防止除零
+                    denom = 1  # 兜底
+                stag_ratio = (scout_stagnation - self.regret_trigger) / denom  # 比例
+                if stag_ratio < 0.0:  # 下限
+                    stag_ratio = 0.0  # 截断
+                if stag_ratio > 1.0:  # 上限
+                    stag_ratio = 1.0  # 截断
+                regret_frac = self.regret_frac * (0.5 + 0.5 * stag_ratio)  # 自适应比例
+                candidate = _ruin_and_recreate_regret_jit(  # Regret-lite 重建
+                    current_tour, D, ruin_pct, knn_idx,  # 基础参数
+                    regret_frac, self.regret_sample, self.regret_min_remove  # 自适应参数
+                )
+            else:  # 常规重建
+                candidate = _ruin_and_recreate_jit(current_tour, D, ruin_pct, knn_idx)  # Cheapest
             
             # Reset DLB for candidate (major structural change)
             dlb_mask[:] = False 
@@ -1609,19 +1773,17 @@ class r0123456:
         while improved:  # 持续搜索
             improved = False  # 先设为未改进
             dlb_mask[:] = False  # 重置DLB
-            if _candidate_or_opt_jit(tour, D, knn_idx, max_iters=max_iters, dlb_mask=dlb_mask):  # k=1
+            if _candidate_or_opt_jit(tour, D, knn_idx, max_iters=max_iters, dlb_mask=dlb_mask, block_size=1):  # k=1
                 improved = True  # 标记改进
                 continue  # 回到k=1
-            for _ in range(block_steps):  # 尝试块长2
-                if _or_opt_once_jit(tour, D, 2):  # k=2
-                    improved = True  # 标记改进
-                    break  # 结束本层
-            if improved:  # 若已改进
+            dlb_mask[:] = False  # 重置DLB
+            if _candidate_or_opt_jit(tour, D, knn_idx, max_iters=block_steps, dlb_mask=dlb_mask, block_size=2):  # k=2
+                improved = True  # 标记改进
                 continue  # 回到k=1
-            for _ in range(block_steps):  # 尝试块长3
-                if _or_opt_once_jit(tour, D, 3):  # k=3
-                    improved = True  # 标记改进
-                    break  # 结束本层
+            dlb_mask[:] = False  # 重置DLB
+            if _candidate_or_opt_jit(tour, D, knn_idx, max_iters=block_steps, dlb_mask=dlb_mask, block_size=3):  # k=3
+                improved = True  # 标记改进
+                continue  # 回到k=1
 
     def _gls_update_penalties(self, tour: np.ndarray, D: np.ndarray, penalties: np.ndarray):  # GLS惩罚更新
         n = tour.shape[0]  # 城市数
