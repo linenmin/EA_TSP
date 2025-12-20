@@ -6,6 +6,6 @@
 *.docx
 *.zip
 *.txt
-
+*logs
 __pycache__
 *.pyc

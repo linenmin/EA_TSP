@@ -1,0 +1,11 @@
+Initializing solver...
+Running optimize...
+Traceback (most recent call last):
+  File "D:\BaiduNetdiskWorkspace\Leuven\7th\Genetic Algorithms\project\verify_submission.py", line 16, in <module>
+    test_run()
+  File "D:\BaiduNetdiskWorkspace\Leuven\7th\Genetic Algorithms\project\verify_submission.py", line 12, in test_run
+    solver.optimize("tour1000.csv")
+  File "D:\BaiduNetdiskWorkspace\Leuven\7th\Genetic Algorithms\project\r0927480.py", line 1112, in optimize
+    args=(distanceMatrix, q_to_scout, q_from_scout, is_symmetric)
+                                                    ^^^^^^^^^^^^
+UnboundLocalError: cannot access local variable 'is_symmetric' where it is not associated with a value
