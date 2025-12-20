@@ -670,6 +670,7 @@ class r0927480:
             init_population_jit(population, D, finite_mask, knn_idx, strat_probs, seeds, int(self.rng.integers(3, 11)))
             fitness = np.empty(lam, dtype=np.float64); batch_lengths_jit(population, D, fitness)
             best_ever_fitness, stagnation_counter, gen = fitness.min(), 0, 0
+            current_run_best = best_ever_fitness  # 本轮最优（用于判定停滞）
             best_tour_ever = population[np.argmin(fitness)].copy()  # 全局最优解（用于报告）
             c_pop, c_fit, dlb_mask = np.empty((lam, n), dtype=np.int32), np.empty(lam, dtype=np.float64), np.zeros(n, dtype=np.bool_)
             last_patient_sent_time = 0.0
@@ -704,11 +705,20 @@ class r0927480:
                     if better: population[tidx][:], fitness[tidx] = c_pop[i][:], c_fit[i]
                 
                 best_idx = np.argmin(fitness); bestObjective = float(fitness[best_idx])
+                
+                # 1. 判定是否打破"本轮"最优（只要本轮还在进步，就给机会继续挖）
+                if bestObjective < current_run_best:
+                    current_run_best = bestObjective
+                    stagnation_counter = 0  # 只要本轮在进步，就清零！
+                else:
+                    stagnation_counter += 1  # 真的挖不动了才累加
+                
+                # 2. 判定是否打破"历史"最优（用于记录和报告）
                 if bestObjective < best_ever_fitness:
                     best_ever_fitness = bestObjective
-                    best_tour_ever = population[best_idx].copy()  # 更新全局最优解
-                    stagnation_counter, gls_penalties[:], gls_active = 0, 0, False
-                else: stagnation_counter += 1
+                    best_tour_ever = population[best_idx].copy()
+                    stagnation_counter = 0  # 打破历史记录当然也清零
+                    gls_penalties[:], gls_active = 0, False
                 
                 if stagnation_counter > (stagnation_limit // 2) and (time.time() - last_patient_sent_time > 5.0):
                     try: q_to_scout.put_nowait(population[best_idx].copy()); last_patient_sent_time = time.time()
@@ -721,9 +731,7 @@ class r0927480:
                         D_gls = np.ascontiguousarray(D + (0.03 * (bestObjective / n)) * gls_penalties)
                 else: gls_active = False
                 
-                if stagnation_counter >= stagnation_limit:
-                    print(f"Gen {gen}: RESTART! stagnation={stagnation_counter}, current_pop_best={fitness.min():.2f}, global_best={best_ever_fitness:.2f}")
-                    
+                if stagnation_counter >= stagnation_limit:                    
                     # 1. 清空 Scout 发回的旧消息
                     while not q_from_scout.empty():
                         try: q_from_scout.get_nowait()
@@ -750,9 +758,7 @@ class r0927480:
                             mutated = double_bridge_move(mutated)
                         population[i] = mutated
                     
-                    batch_lengths_jit(population, D, fitness)
-                    print(f"         After restart: new_pop_best={fitness.min():.2f}")
-                    
+                    batch_lengths_jit(population, D, fitness)                    
                     # 4. 让 Scout 也同步到新区域
                     try:
                         q_to_scout.put_nowait(population[np.argmin(fitness)].copy())
@@ -762,6 +768,8 @@ class r0927480:
                             q_to_scout.put_nowait(population[np.argmin(fitness)].copy())
                         except: pass
                     
+                    # 5. 重置本轮最优和停滞计数器
+                    current_run_best = fitness.min()  # 让新种群从新起点开始计算
                     stagnation_counter = 0
 
                 # 报告时使用全局最优解 best_tour_ever
