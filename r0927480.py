@@ -722,12 +722,41 @@ class r0927480:
                 else: gls_active = False
                 
                 if stagnation_counter >= stagnation_limit:
-                    # 彻底重启：不保留上轮最优解，让新种群独立演化
+                    # 双桥重启：只掀房顶，不拆地基
                     print(f"Gen {gen}: RESTART! stagnation={stagnation_counter}, current_pop_best={fitness.min():.2f}, global_best={best_ever_fitness:.2f}")
-                    init_population_jit(population, D, finite_mask, knn_idx, strat_probs, np.random.randint(0, 1<<30, lam).astype(np.int64), int(self.rng.integers(3, 11)))
+                    
+                    # 1. 清空 Scout 发回的旧消息
+                    while not q_from_scout.empty():
+                        try: q_from_scout.get_nowait()
+                        except queue.Empty: break
+                    
+                    # 2. 先用随机策略填充整个种群
+                    restart_strat_probs = np.array([0.2, 0.3, 0.5], dtype=np.float64)
+                    init_population_jit(population, D, finite_mask, knn_idx, restart_strat_probs, np.random.randint(0, 1<<30, lam).astype(np.int64), int(self.rng.integers(10, 30)))
+                    
+                    # 3. 【关键】用 best_tour_ever 做多次双桥变异，填充种群的前 1/3
+                    # 这样起点在 ~100k 而不是 ~107k，省下几百代的收敛时间
+                    n_elites = lam // 3
+                    for i in range(n_elites):
+                        mutated = best_tour_ever.copy()
+                        # 只做 1 次双桥移动，保持较好的起点
+                        mutated = double_bridge_move(mutated)
+                        population[i] = mutated
+                    
                     batch_lengths_jit(population, D, fitness)
                     print(f"         After restart: new_pop_best={fitness.min():.2f}")
-                    stagnation_counter, gls_active, gls_penalties[:] = 0, False, 0
+                    
+                    # 4. 让 Scout 也同步到新区域：发送双桥变异后的新起点
+                    try:
+                        q_to_scout.put_nowait(population[0].copy())
+                    except queue.Full:
+                        try:
+                            q_to_scout.get_nowait()  # 丢弃一个旧任务
+                            q_to_scout.put_nowait(population[0].copy())
+                        except: pass
+                    
+                    # 5. GLS 继承 - 保留惩罚矩阵
+                    stagnation_counter, gls_active = 0, False
 
                 # 报告时使用全局最优解 best_tour_ever
                 start_pos = np.where(best_tour_ever == 0)[0]
