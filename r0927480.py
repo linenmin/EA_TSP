@@ -722,7 +722,6 @@ class r0927480:
                 else: gls_active = False
                 
                 if stagnation_counter >= stagnation_limit:
-                    # 双桥重启：只掀房顶，不拆地基
                     print(f"Gen {gen}: RESTART! stagnation={stagnation_counter}, current_pop_best={fitness.min():.2f}, global_best={best_ever_fitness:.2f}")
                     
                     # 1. 清空 Scout 发回的旧消息
@@ -730,33 +729,40 @@ class r0927480:
                         try: q_from_scout.get_nowait()
                         except queue.Empty: break
                     
-                    # 2. 先用随机策略填充整个种群
-                    restart_strat_probs = np.array([0.2, 0.3, 0.5], dtype=np.float64)
-                    init_population_jit(population, D, finite_mask, knn_idx, restart_strat_probs, np.random.randint(0, 1<<30, lam).astype(np.int64), int(self.rng.integers(10, 30)))
+                    # 2. 彻底的 GLS 遗忘
+                    gls_penalties[:] = 0
+                    gls_active = False
+                    D_gls = None
                     
-                    # 3. 【关键】用 best_tour_ever 做多次双桥变异，填充种群的前 1/3
-                    # 这样起点在 ~100k 而不是 ~107k，省下几百代的收敛时间
-                    n_elites = lam // 3
-                    for i in range(n_elites):
+                    # 3. 【70/30 混合策略】
+                    # Part A: 70% 完全重新生成（模拟手动重启 python verify_submission.py）
+                    reset_count = int(lam * 0.7)
+                    restart_strat_probs = np.array([0.05, 0.15, 0.8], dtype=np.float64)  # 80% 随机
+                    init_population_jit(population[:reset_count], D, finite_mask, knn_idx, restart_strat_probs, 
+                                        np.random.randint(0, 1<<30, reset_count).astype(np.int64), 
+                                        int(self.rng.integers(15, 40)))  # rcl_r 很大
+                    
+                    # Part B: 30% 保留旧皇血脉（1-3次双桥变异）
+                    for i in range(reset_count, lam):
                         mutated = best_tour_ever.copy()
-                        # 只做 1 次双桥移动，保持较好的起点
-                        mutated = double_bridge_move(mutated)
+                        kicks = int(self.rng.integers(1, 4))  # 1-3 次双桥
+                        for _ in range(kicks):
+                            mutated = double_bridge_move(mutated)
                         population[i] = mutated
                     
                     batch_lengths_jit(population, D, fitness)
                     print(f"         After restart: new_pop_best={fitness.min():.2f}")
                     
-                    # 4. 让 Scout 也同步到新区域：发送双桥变异后的新起点
+                    # 4. 让 Scout 也同步到新区域
                     try:
-                        q_to_scout.put_nowait(population[0].copy())
+                        q_to_scout.put_nowait(population[np.argmin(fitness)].copy())
                     except queue.Full:
                         try:
-                            q_to_scout.get_nowait()  # 丢弃一个旧任务
-                            q_to_scout.put_nowait(population[0].copy())
+                            q_to_scout.get_nowait()
+                            q_to_scout.put_nowait(population[np.argmin(fitness)].copy())
                         except: pass
                     
-                    # 5. GLS 继承 - 保留惩罚矩阵
-                    stagnation_counter, gls_active = 0, False
+                    stagnation_counter = 0
 
                 # 报告时使用全局最优解 best_tour_ever
                 start_pos = np.where(best_tour_ever == 0)[0]
