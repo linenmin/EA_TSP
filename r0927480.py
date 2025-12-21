@@ -78,6 +78,16 @@ def build_knn_idx(D, finite_mask, K):
     return knn
 
 @njit(cache=True, fastmath=True)
+def _tour_feasible_jit(tour, finite_mask):
+    """检查路径是否全部边都是可行的（没有 inf）"""
+    n = tour.shape[0]
+    for i in range(n):
+        u, v = tour[i], tour[(i + 1) % n]
+        if not finite_mask[u, v]:
+            return False
+    return True
+
+@njit(cache=True, fastmath=True)
 def _two_opt_once_jit_safe(tour, D):
     n = tour.size
     best_delta = 0.0
@@ -633,11 +643,18 @@ def init_population_jit(pop, D, finite_mask, knn_idx, strat_probs, seeds, rcl_r)
     for i in prange(lam):
         np.random.seed(seeds[i])  
         u = np.random.rand()
-        if u < strat_probs[0]: tour = _rcl_nn_tour_jit(D, finite_mask, knn_idx, rcl_r)
-        elif u < strat_probs[0] + strat_probs[1]: tour = _insertion_tour_jit(D, finite_mask, use_farthest=(np.random.rand() < 0.5))
+        if u < strat_probs[0]: 
+            tour = _rcl_nn_tour_jit(D, finite_mask, knn_idx, rcl_r)
+        elif u < strat_probs[0] + strat_probs[1]: 
+            tour = _insertion_tour_jit(D, finite_mask, use_farthest=(np.random.rand() < 0.5))
         else:
             tour = _rand_perm_jit(n)
-            if not _repair_jit(tour, D, finite_mask, 50): tour = _rcl_nn_tour_jit(D, finite_mask, knn_idx, rcl_r)
+            # 尝试修复，最多 50 次 2-opt
+            _repair_jit(tour, D, finite_mask, 50)
+        
+        # 【关键】确保路径可行，否则回退到安全的贪心方法
+        if not _tour_feasible_jit(tour, finite_mask):
+            tour = _rcl_nn_tour_jit(D, finite_mask, knn_idx, rcl_r)
         pop[i] = tour
 
 @njit(cache=True)
@@ -671,7 +688,14 @@ def evolve_population_jit(population, c_pop, fitness, D, finite_mask, exploit_mu
                     else:
                         for k in range(u, v): c1[k] = c1[k+1]
                     c1[v] = city
-        if is_symmetric: _repair_jit(c1, D, finite_mask)
+        # 【修复与回滚逻辑】区分对称和非对称
+        c1_ok = False
+        if is_symmetric:
+            if _repair_jit(c1, D, finite_mask): c1_ok = True
+        else:
+            if _tour_feasible_jit(c1, finite_mask): c1_ok = True
+        if not c1_ok:
+            c1[:] = population[p1][:]  # 回滚到父代
         
         # Mutation & Repair C2
         if np.random.random() < exploit_mut:
@@ -689,7 +713,14 @@ def evolve_population_jit(population, c_pop, fitness, D, finite_mask, exploit_mu
                     else:
                         for k in range(u, v): c2[k] = c2[k+1]
                     c2[v] = city
-        if is_symmetric: _repair_jit(c2, D, finite_mask)
+        # 【修复与回滚逻辑】区分对称和非对称
+        c2_ok = False
+        if is_symmetric:
+            if _repair_jit(c2, D, finite_mask): c2_ok = True
+        else:
+            if _tour_feasible_jit(c2, finite_mask): c2_ok = True
+        if not c2_ok:
+            c2[:] = population[p2][:]  # 回滚到父代
 
 # ==============================================================================
 # Subprocess Worker
@@ -800,7 +831,16 @@ class r0927480:
                 # Scout Check
                 try:
                     healed = q_from_scout.get_nowait()
-                    h_fit = tour_length_jit(healed, D); worst_idx = np.argmax(fitness)
+                    h_fit = tour_length_jit(healed, D)
+                    
+                    # Debug: 诊断 Scout 结果是否有效
+                    pop_mean = fitness.mean() if np.isfinite(fitness).all() else np.nanmean(fitness)
+                    pop_min = fitness.min()
+                    print(f"[Main] Received from Scout: {h_fit:.2f} (Pop Min: {pop_min:.2f}, Mean: {pop_mean:.2f})")
+                    if h_fit > pop_mean:
+                        print("       -> WARNING: Scout result is worse than average, likely dead on arrival.")
+                    
+                    worst_idx = np.argmax(fitness)
                     population[worst_idx][:], fitness[worst_idx] = healed[:], h_fit
                     if h_fit < best_ever_fitness:
                         best_ever_fitness, stagnation_counter, gls_penalties[:], gls_active = h_fit, 0, 0, False
