@@ -616,7 +616,7 @@ def scout_worker(D, q_in, q_out, is_symmetric):
             dlb_mask[:], improved, block_steps = False, True, 10
             while improved:
                 improved = False; dlb_mask[:] = False
-                if _candidate_or_opt_jit(candidate, D, knn_idx, max_iters=3000, dlb_mask=dlb_mask, block_size=1): improved = True; continue
+                if _candidate_or_opt_jit(candidate, D, knn_idx, max_iters=5000, dlb_mask=dlb_mask, block_size=1): improved = True; continue
                 dlb_mask[:] = False
                 if _candidate_block_swap_jit(candidate, D, knn_idx, max_iters=block_steps, dlb_mask=dlb_mask, block_size=2): improved = True; continue
                 dlb_mask[:] = False
