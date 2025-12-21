@@ -594,26 +594,29 @@ def scout_worker(D, q_in, q_out, is_symmetric):
         current_fit = tour_length_jit(current_tour, D)
         best_known_bound, dlb_mask = current_fit, np.zeros(n, dtype=np.bool_)
         iter_count, last_improv_iter, last_send_iter, scout_stagnation = 0, 0, 0, 0
-        ruin_gears = np.array([0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.5, 0.55, 0.6])
+        ruin_gears = np.array([0.03, 0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45])
         patient_entry_fit = float('inf')
         
         while True:
             iter_count += 1
+            if iter_count % 100 == 0:
+                print(f"[Scout] iter={iter_count}, best={best_known_bound:.2f}, stagnation={scout_stagnation}")
             try:
                 latest_patient = q_in.get_nowait()
                 p_fit = tour_length_jit(latest_patient, D)
+                print(f"[Scout] NEW PATIENT: iter={iter_count}, patient_fit={p_fit:.2f}")
                 current_tour[:], current_fit, dlb_mask[:] = latest_patient[:], p_fit, False
                 patient_entry_fit, last_improv_iter, scout_stagnation, best_known_bound = p_fit, iter_count, 0, p_fit
             except queue.Empty: pass
             
-            ruin_pct = ruin_gears[int((iter_count - last_improv_iter) // 250) % 11]
+            ruin_pct = ruin_gears[int((iter_count - last_improv_iter) // 250) % 10]
             if scout_stagnation >= 80: candidate = _ruin_and_recreate_regret_jit(current_tour, D, ruin_pct, knn_idx, 0.25, 8, 30)
             else: candidate = _ruin_and_recreate_jit(current_tour, D, ruin_pct, knn_idx)
             
-            dlb_mask[:], improved, block_steps = False, True, 3
+            dlb_mask[:], improved, block_steps = False, True, 10
             while improved:
                 improved = False; dlb_mask[:] = False
-                if _candidate_or_opt_jit(candidate, D, knn_idx, max_iters=500, dlb_mask=dlb_mask, block_size=1): improved = True; continue
+                if _candidate_or_opt_jit(candidate, D, knn_idx, max_iters=3000, dlb_mask=dlb_mask, block_size=1): improved = True; continue
                 dlb_mask[:] = False
                 if _candidate_block_swap_jit(candidate, D, knn_idx, max_iters=block_steps, dlb_mask=dlb_mask, block_size=2): improved = True; continue
                 dlb_mask[:] = False
@@ -625,8 +628,8 @@ def scout_worker(D, q_in, q_out, is_symmetric):
             if cand_fit < best_known_bound: best_known_bound = cand_fit
             gap = (cand_fit - patient_entry_fit) / patient_entry_fit if patient_entry_fit > 0 else 0
             is_breakthrough, tolerance = cand_fit < patient_entry_fit, 0.0
-            if scout_stagnation > 50: tolerance = 0.005
-            if scout_stagnation > 200: tolerance = 0.01
+            if scout_stagnation > 500: tolerance = 0.003
+            if scout_stagnation > 2000: tolerance = 0.008
             if is_breakthrough or ((gap <= tolerance) and (gap > -1.0) and (iter_count - last_send_iter > 200)):
                 try:
                     q_out.put_nowait(candidate.copy()); last_send_iter = iter_count
