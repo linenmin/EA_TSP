@@ -435,6 +435,116 @@ def _bfs_ruin_mask_jit(n, knn_idx, n_remove):
                 if count >= n_remove: break
     return removed_mask
 
+@njit(cache=True, fastmath=True)
+def _ruin_worst_edges_stochastic_jit(tour, D, n_remove):
+    """锦标赛选择法的最差边破坏 - 极速 O(K) 复杂度"""
+    n = tour.shape[0]
+    mask = np.zeros(n, dtype=np.bool_)
+    
+    tournament_size = 4  # 每次随机看多少条边
+    count = 0
+    max_attempts = n_remove * 5  # 防止死循环
+    attempts = 0
+    
+    while count < n_remove and attempts < max_attempts:
+        attempts += 1
+        
+        # 举办一次锦标赛：找到候选者中最差的那个
+        best_candidate_idx = -1
+        max_dist = -1.0
+        
+        for _ in range(tournament_size):
+            idx = np.random.randint(0, n)
+            u, v = tour[idx], tour[(idx + 1) % n]
+            if mask[u] or mask[v]: continue  # 已被炸
+            dist = D[u, v]
+            if dist > max_dist:
+                max_dist = dist
+                best_candidate_idx = idx
+        
+        # 炸掉赢家（最长的那条边）
+        if best_candidate_idx != -1:
+            u_idx = best_candidate_idx
+            v_idx = (best_candidate_idx + 1) % n
+            if not mask[tour[u_idx]]:
+                mask[tour[u_idx]] = True
+                count += 1
+            if count >= n_remove: break
+            if not mask[tour[v_idx]]:
+                mask[tour[v_idx]] = True
+                count += 1
+    
+    # 如果没凑够，随机补几个
+    if count < n_remove:
+        for _ in range((n_remove - count) * 2):
+            idx = np.random.randint(0, n)
+            if not mask[tour[idx]]:
+                mask[tour[idx]] = True
+                count += 1
+            if count >= n_remove: break
+    
+    return mask
+
+@njit(cache=True, nogil=True)
+def _hybrid_ruin_mask_jit(tour, D, knn_idx, n_remove, mode):
+    """混合破坏策略: mode=0 BFS, mode=1 Sequence, mode=2 Worst Edge"""
+    n = len(tour)
+    mask = np.zeros(n, np.bool_)
+    
+    if mode == 0:
+        # 策略 0: BFS 空间破坏（原有）
+        mask = _bfs_ruin_mask_jit(n, knn_idx, n_remove)
+        
+    elif mode == 1:
+        # 策略 1: 序列破坏 - 移除 tour 中连续的一段
+        start = np.random.randint(0, n)
+        for i in range(n_remove):
+            mask[tour[(start + i) % n]] = True
+            
+    elif mode == 2:
+        # 策略 2: 锦标赛选择最差边破坏（极速 O(K) 复杂度）
+        mask = _ruin_worst_edges_stochastic_jit(tour, D, n_remove)
+    
+    return mask
+
+@njit(cache=True, nogil=True)
+def _hybrid_ruin_and_recreate_jit(tour, D, ruin_pct, knn_idx, mode):
+    """混合破坏策略的 ruin and recreate"""
+    n = len(tour)
+    n_remove = int(n * ruin_pct)
+    if n_remove < 2: return tour.copy()
+    
+    mask = _hybrid_ruin_mask_jit(tour, D, knn_idx, n_remove, mode)
+    
+    # 分离 kept 和 removed
+    removed_cities = np.empty(n_remove, np.int32)
+    kept_cities = np.empty(n - n_remove, np.int32)
+    kp, rp = 0, 0
+    for i in range(n):
+        if mask[tour[i]]:
+            if rp < n_remove: removed_cities[rp] = tour[i]; rp += 1
+        else:
+            if kp < n - n_remove: kept_cities[kp] = tour[i]; kp += 1
+    
+    current_tour = kept_cities
+    np.random.shuffle(removed_cities)
+    
+    # 贪婪插入重建
+    for idx in range(rp):
+        city = removed_cities[idx]
+        best_delta, best_pos, m_curr = 1e20, -1, len(current_tour)
+        for i in range(m_curr):
+            u, v = current_tour[i], current_tour[(i + 1) % m_curr]
+            delta = D[u, city] + D[city, v] - D[u, v]
+            if delta < best_delta: best_delta, best_pos = delta, i
+        new_t = np.empty(len(current_tour) + 1, np.int32)
+        new_t[:best_pos+1] = current_tour[:best_pos+1]
+        new_t[best_pos+1] = city
+        new_t[best_pos+2:] = current_tour[best_pos+1:]
+        current_tour = new_t
+    
+    return current_tour
+
 @njit(cache=True, nogil=True)
 def _ruin_and_recreate_regret_jit(tour, D, ruin_pct, knn_idx, regret_frac, regret_sample, regret_min_remove):
     n = len(tour)
@@ -610,8 +720,14 @@ def scout_worker(D, q_in, q_out, is_symmetric):
             except queue.Empty: pass
             
             ruin_pct = ruin_gears[int((iter_count - last_improv_iter) // 250) % 10]
-            if scout_stagnation >= 80: candidate = _ruin_and_recreate_regret_jit(current_tour, D, ruin_pct, knn_idx, 0.25, 8, 30)
-            else: candidate = _ruin_and_recreate_jit(current_tour, D, ruin_pct, knn_idx)
+            
+            # 轮盘赌选择破坏策略: 70% BFS, 20% Worst Edge, 10% Sequence
+            rand_val = np.random.rand()
+            if rand_val < 0.7: mode = 0      # BFS 空间破坏
+            elif rand_val < 0.9: mode = 2    # Worst Edge 最差边破坏
+            else: mode = 1                   # Sequence 序列破坏
+            
+            candidate = _hybrid_ruin_and_recreate_jit(current_tour, D, ruin_pct, knn_idx, mode)
             
             dlb_mask[:], improved, block_steps = False, True, 10
             while improved:
