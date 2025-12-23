@@ -148,15 +148,55 @@ def double_bridge_move(tour):
     return new_tour
 
 @njit(cache=True, fastmath=True)
-def _candidate_or_opt_jit(tour, D, knn_idx, max_iters=100, dlb_mask=None, block_size=1):
+def _make_move_opt(tour, pos, u_idx, block_size, t_idx_new, temp_buffer):
+    """零内存分配的 Or-opt 移动"""
+    n = len(tour)
+    
+    # 移除 block 后重建 tour，并在 t_idx_new 后插入 block
+    ptr = 0
+    block_start = u_idx
+    block_end = u_idx + block_size
+    
+    # 遍历原 tour，跳过 block
+    inserted = False
+    for i in range(n):
+        if i >= block_start and i < block_end:
+            continue
+        temp_buffer[ptr] = tour[i]
+        # 计算在去除 block 后的索引
+        adj_idx = i if i < block_start else i - block_size
+        if not inserted and adj_idx == t_idx_new:
+            ptr += 1
+            # 插入 block
+            for b in range(block_size):
+                temp_buffer[ptr] = tour[block_start + b]
+                ptr += 1
+            inserted = True
+        else:
+            ptr += 1
+    
+    # 如果 t_idx_new 是最后一个位置
+    if not inserted:
+        for b in range(block_size):
+            temp_buffer[ptr] = tour[block_start + b]
+            ptr += 1
+    
+    # 拷回
+    for i in range(n):
+        tour[i] = temp_buffer[i]
+        pos[temp_buffer[i]] = i
+
+@njit(cache=True, fastmath=True)
+def _candidate_or_opt_jit(tour, D, knn_idx, pos_buf, tour_buf, max_iters=100, dlb_mask=None, block_size=1):
+    """内存优化版 Or-opt：接收外部 buffer，零内存分配"""
     n = tour.shape[0]
     K = knn_idx.shape[1]
     block_size = int(block_size)
     if block_size < 1: block_size = 1
     if block_size >= n: return False 
     
-    pos = np.empty(n, np.int32)
-    for i in range(n): pos[tour[i]] = i
+    # 使用传入的 buffer
+    for i in range(n): pos_buf[tour[i]] = i
     
     improved = False 
     use_dlb = (dlb_mask is not None) 
@@ -192,7 +232,7 @@ def _candidate_or_opt_jit(tour, D, knn_idx, max_iters=100, dlb_mask=None, block_
             for k in range(K): 
                 target = knn_idx[block_head, k] 
                 if target == -1: break 
-                t_idx = pos[target] 
+                t_idx = pos_buf[target] 
                 if t_idx == prev_idx: continue 
                 if t_idx >= u_idx and t_idx < u_idx + block_size: continue 
                 
@@ -208,27 +248,13 @@ def _candidate_or_opt_jit(tour, D, knn_idx, max_iters=100, dlb_mask=None, block_
                 gain = (remove_cost - new_edge_cost) + (old_edge_cost - insert_cost)
                 
                 if gain > 1e-6: 
-                    # Strictly align with Baseline copy logic
-                    block = np.empty(block_size, dtype=tour.dtype)
-                    for b in range(block_size): block[b] = tour[u_idx + b]
-                    
-                    temp_len = n - block_size
-                    temp_tour = np.empty(temp_len, dtype=tour.dtype)
-                    if u_idx > 0: temp_tour[:u_idx] = tour[:u_idx]
-                    if u_idx + block_size < n: temp_tour[u_idx:] = tour[u_idx + block_size:]
-                    
+                    # 计算去除 block 后的 t_idx
                     t_idx_new = t_idx
                     if t_idx > u_idx: t_idx_new -= block_size
                     
-                    new_tour = np.empty(n, dtype=tour.dtype)
-                    idx = 0
-                    for i in range(temp_len):
-                        new_tour[idx] = temp_tour[i]; idx += 1
-                        if i == t_idx_new:
-                            for b in range(block_size): new_tour[idx] = block[b]; idx += 1
+                    # 使用 buffer 执行移动
+                    _make_move_opt(tour, pos_buf, u_idx, block_size, t_idx_new, tour_buf)
                     
-                    tour[:] = new_tour[:]
-                    for i in range(n): pos[tour[i]] = i
                     improved = True
                     move_found = True
                     found_in_try = True
@@ -237,7 +263,7 @@ def _candidate_or_opt_jit(tour, D, knn_idx, max_iters=100, dlb_mask=None, block_
                         dlb_mask[next_after] = False 
                         dlb_mask[target] = False 
                         dlb_mask[target_next] = False
-                        for b in range(block_size): dlb_mask[block[b]] = False
+                        for b in range(block_size): dlb_mask[tour[pos_buf[tour[u_idx + b]]]] = False
                     break 
             if move_found: continue 
             else: 
@@ -245,40 +271,47 @@ def _candidate_or_opt_jit(tour, D, knn_idx, max_iters=100, dlb_mask=None, block_
         if not found_in_try and use_dlb: break
     return improved
 
+
 @njit(cache=True, fastmath=True)
-def _candidate_block_swap_jit(tour, D, knn_idx, max_iters=50, dlb_mask=None, block_size=2):
+def _candidate_block_swap_jit(tour, D, knn_idx, pos_buf, tour_buf, max_iters=50, dlb_mask=None, block_size=2):
+    """内存优化版 Block Swap：接收外部 buffer，零内存分配"""
     n = tour.shape[0]
     K = knn_idx.shape[1]
     block_size = int(block_size)
     if block_size < 1: block_size = 1
     if block_size * 2 >= n: return False 
     
-    pos = np.empty(n, np.int32)
-    for i in range(n): pos[tour[i]] = i
+    # 使用传入的 buffer
+    for i in range(n): pos_buf[tour[i]] = i
     
     improved = False
     use_dlb = (dlb_mask is not None)
+    
     for _ in range(max_iters):
         found_in_try = False
         start = np.random.randint(0, n)
+        
         for offset in range(n):
             u_idx = (start + offset) % n 
             u = tour[u_idx] 
             if use_dlb and dlb_mask[u]: continue
+            
             if u_idx + block_size >= n: 
                 if use_dlb: dlb_mask[u] = True
                 continue
+            
             i = u_idx        
             a_idx = i - 1 if i > 0 else n - 1
             d_idx = i + block_size 
             a, b, c, d = tour[a_idx], tour[i], tour[i + block_size - 1], tour[d_idx]
+            
             if not np.isfinite(D[a, b]) or not np.isfinite(D[c, d]): continue
             
             move_found = False
             for k in range(K):
                 target = knn_idx[a, k] 
                 if target == -1: break
-                j = pos[target] 
+                j = pos_buf[target]  # 使用 pos_buf
                 if j <= i or j < i + block_size or j + block_size >= n: continue
                 
                 e_idx = j - 1
@@ -294,18 +327,25 @@ def _candidate_block_swap_jit(tour, D, knn_idx, max_iters=50, dlb_mask=None, blo
                     new_cost = D[a, f] + D[g, d] + D[e, b] + D[c, h]
                 
                 if old_cost - new_cost > 1e-6: 
-                    new_tour = np.empty_like(tour)
-                    idx = 0
-                    for t in range(0, i): new_tour[idx] = tour[t]; idx += 1
-                    for t in range(j, j + block_size): new_tour[idx] = tour[t]; idx += 1
-                    for t in range(i + block_size, j): new_tour[idx] = tour[t]; idx += 1
-                    for t in range(i, i + block_size): new_tour[idx] = tour[t]; idx += 1
-                    for t in range(j + block_size, n): new_tour[idx] = tour[t]; idx += 1
-                    tour[:] = new_tour[:]
-                    for t in range(n): pos[tour[t]] = t
+                    # 使用 buffer 执行交换
+                    ptr = 0
+                    for t in range(0, i): tour_buf[ptr] = tour[t]; ptr += 1
+                    for t in range(j, j + block_size): tour_buf[ptr] = tour[t]; ptr += 1
+                    for t in range(i + block_size, j): tour_buf[ptr] = tour[t]; ptr += 1
+                    for t in range(i, i + block_size): tour_buf[ptr] = tour[t]; ptr += 1
+                    for t in range(j + block_size, n): tour_buf[ptr] = tour[t]; ptr += 1
+                    
+                    # 拷回并更新 pos
+                    for t in range(n):
+                        tour[t] = tour_buf[t]
+                        pos_buf[tour_buf[t]] = t
+                    
                     improved = True; move_found = True; found_in_try = True
                     if use_dlb:
-                        for city in [a, b, c, d, e, f, g, h]: dlb_mask[city] = False
+                        dlb_mask[a] = False; dlb_mask[b] = False
+                        dlb_mask[c] = False; dlb_mask[d] = False
+                        dlb_mask[e] = False; dlb_mask[f] = False
+                        dlb_mask[g] = False; dlb_mask[h] = False
                     break 
             if move_found: continue
             else:
@@ -519,14 +559,13 @@ def _hybrid_ruin_mask_jit(tour, D, knn_idx, n_remove, mode):
 
 @njit(cache=True, nogil=True)
 def _hybrid_ruin_and_recreate_jit(tour, D, ruin_pct, knn_idx, mode):
-    """混合破坏策略的 ruin and recreate"""
+    """混合破坏策略的 ruin and recreate（保留原版用于兼容）"""
     n = len(tour)
     n_remove = int(n * ruin_pct)
     if n_remove < 2: return tour.copy()
     
     mask = _hybrid_ruin_mask_jit(tour, D, knn_idx, n_remove, mode)
     
-    # 分离 kept 和 removed
     removed_cities = np.empty(n_remove, np.int32)
     kept_cities = np.empty(n - n_remove, np.int32)
     kp, rp = 0, 0
@@ -539,7 +578,6 @@ def _hybrid_ruin_and_recreate_jit(tour, D, ruin_pct, knn_idx, mode):
     current_tour = kept_cities
     np.random.shuffle(removed_cities)
     
-    # 贪婪插入重建
     for idx in range(rp):
         city = removed_cities[idx]
         best_delta, best_pos, m_curr = 1e20, -1, len(current_tour)
@@ -554,6 +592,65 @@ def _hybrid_ruin_and_recreate_jit(tour, D, ruin_pct, knn_idx, mode):
         current_tour = new_t
     
     return current_tour
+
+@njit(cache=True, fastmath=True, nogil=True)
+def _hybrid_ruin_and_recreate_inplace(tour, D, ruin_pct, knn_idx, mode, tour_buf, removed_buf):
+    """内存优化版：完全零分配的 Ruin & Recreate"""
+    n = tour.shape[0]
+    n_remove = int(n * ruin_pct)
+    if n_remove < 2: 
+        tour_buf[:] = tour[:]
+        return
+    
+    mask = _hybrid_ruin_mask_jit(tour, D, knn_idx, n_remove, mode)
+    
+    kp = 0
+    rp = 0
+    for i in range(n):
+        city = tour[i]
+        if mask[city]:
+            if rp < n_remove:
+                removed_buf[rp] = city
+                rp += 1
+        else:
+            tour_buf[kp] = city
+            kp += 1
+    
+    current_len = kp
+    np.random.shuffle(removed_buf[:rp])
+    
+    # 贪婪插入重建 (In-Place Shift)
+    for idx in range(rp):
+        city = removed_buf[idx]
+        best_delta = 1e20
+        best_pos = -1
+        
+        # 检查插入到末尾（连接最后一个和第一个）
+        u = tour_buf[current_len - 1]
+        v = tour_buf[0]
+        delta = D[u, city] + D[city, v] - D[u, v]
+        if delta < best_delta:
+            best_delta = delta
+            best_pos = current_len - 1
+        
+        # 检查其他位置
+        for i in range(current_len - 1):
+            u = tour_buf[i]
+            v = tour_buf[i + 1]
+            delta = D[u, city] + D[city, v] - D[u, v]
+            if delta < best_delta:
+                best_delta = delta
+                best_pos = i
+        
+        # In-Place Shift 插入
+        if best_pos == current_len - 1:
+            tour_buf[current_len] = city
+        else:
+            for k in range(current_len, best_pos + 1, -1):
+                tour_buf[k] = tour_buf[k - 1]
+            tour_buf[best_pos + 1] = city
+        
+        current_len += 1
 
 @njit(cache=True, nogil=True)
 def _ruin_and_recreate_regret_jit(tour, D, ruin_pct, knn_idx, regret_frac, regret_sample, regret_min_remove):
@@ -738,38 +835,42 @@ def scout_worker(D, q_in, q_out, is_symmetric):
         ruin_gears = np.array([0.03, 0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45])
         patient_entry_fit = float('inf')
         
+        # 内存优化：预分配所有 buffer
+        pos_buffer = np.empty(n, dtype=np.int32)
+        tour_buffer = np.empty(n, dtype=np.int32)
+        rr_tour_buffer = np.empty(n, dtype=np.int32)  # Ruin & Recreate 专用
+        rr_removed_buffer = np.empty(n, dtype=np.int32)
+        
         while True:
             iter_count += 1
-            if iter_count % 100 == 0:
-                print(f"[Scout] iter={iter_count}, best={best_known_bound:.2f}, stagnation={scout_stagnation}")
             try:
                 latest_patient = q_in.get_nowait()
                 p_fit = tour_length_jit(latest_patient, D)
-                print(f"[Scout] NEW PATIENT: iter={iter_count}, patient_fit={p_fit:.2f}")
                 current_tour[:], current_fit, dlb_mask[:] = latest_patient[:], p_fit, False
                 patient_entry_fit, last_improv_iter, scout_stagnation, best_known_bound = p_fit, iter_count, 0, p_fit
             except queue.Empty: pass
             
             ruin_pct = ruin_gears[int((iter_count - last_improv_iter) // 250) % 10]
             
-            # 轮盘赌选择破坏策略: 70% BFS, 20% Worst Edge, 10% Sequence
             rand_val = np.random.rand()
-            if rand_val < 0.7: mode = 0      # BFS 空间破坏
-            elif rand_val < 0.9: mode = 2    # Worst Edge 最差边破坏
-            else: mode = 1                   # Sequence 序列破坏
+            if rand_val < 0.7: mode = 0
+            elif rand_val < 0.9: mode = 2
+            else: mode = 1
             
-            candidate = _hybrid_ruin_and_recreate_jit(current_tour, D, ruin_pct, knn_idx, mode)
+            # 使用原地版 Ruin & Recreate
+            _hybrid_ruin_and_recreate_inplace(current_tour, D, ruin_pct, knn_idx, mode, rr_tour_buffer, rr_removed_buffer)
+            candidate = rr_tour_buffer  # candidate 现在指向 buffer
             
             dlb_mask[:], improved, block_steps = False, True, 10
             while improved:
                 improved = False; dlb_mask[:] = False
-                if _candidate_or_opt_jit(candidate, D, knn_idx, max_iters=5000, dlb_mask=dlb_mask, block_size=1): improved = True; continue
+                if _candidate_or_opt_jit(candidate, D, knn_idx, pos_buffer, tour_buffer, 5000, dlb_mask, 1): improved = True; continue
                 dlb_mask[:] = False
-                if _candidate_block_swap_jit(candidate, D, knn_idx, max_iters=block_steps, dlb_mask=dlb_mask, block_size=2): improved = True; continue
+                if _candidate_block_swap_jit(candidate, D, knn_idx, pos_buffer, tour_buffer, block_steps, dlb_mask, 2): improved = True; continue
                 dlb_mask[:] = False
-                if _candidate_or_opt_jit(candidate, D, knn_idx, max_iters=block_steps, dlb_mask=dlb_mask, block_size=2): improved = True; continue
+                if _candidate_or_opt_jit(candidate, D, knn_idx, pos_buffer, tour_buffer, block_steps, dlb_mask, 2): improved = True; continue
                 dlb_mask[:] = False
-                if _candidate_or_opt_jit(candidate, D, knn_idx, max_iters=block_steps, dlb_mask=dlb_mask, block_size=3): improved = True; continue
+                if _candidate_or_opt_jit(candidate, D, knn_idx, pos_buffer, tour_buffer, block_steps, dlb_mask, 3): improved = True; continue
             
             cand_fit = tour_length_jit(candidate, D); scout_stagnation += 1
             if cand_fit < best_known_bound: best_known_bound = cand_fit
@@ -824,6 +925,10 @@ class r0927480:
             best_tour_ever = population[np.argmin(fitness)].copy()  # 全局最优解（用于报告）
             c_pop, c_fit, dlb_mask = np.empty((lam, n), dtype=np.int32), np.empty(lam, dtype=np.float64), np.zeros(n, dtype=np.bool_)
             last_patient_sent_time = 0.0
+            
+            # Main 进程 buffer
+            main_pos_buffer = np.empty(n, dtype=np.int32)
+            main_tour_buffer = np.empty(n, dtype=np.int32)
 
             while True:
                 gen += 1
@@ -836,10 +941,6 @@ class r0927480:
                     # Debug: 诊断 Scout 结果是否有效
                     pop_mean = fitness.mean() if np.isfinite(fitness).all() else np.nanmean(fitness)
                     pop_min = fitness.min()
-                    print(f"[Main] Received from Scout: {h_fit:.2f} (Pop Min: {pop_min:.2f}, Mean: {pop_mean:.2f})")
-                    if h_fit > pop_mean:
-                        print("       -> WARNING: Scout result is worse than average, likely dead on arrival.")
-                    
                     worst_idx = np.argmax(fitness)
                     population[worst_idx][:], fitness[worst_idx] = healed[:], h_fit
                     if h_fit < best_ever_fitness:
@@ -855,7 +956,7 @@ class r0927480:
                 elite_indices = np.argsort(c_fit)[:elite_count]
                 for idx in elite_indices:
                     dlb_mask[:] = False
-                    self._vnd_or_opt_inplace(c_pop[idx], D_ls, knn_idx, dlb_mask, exploit_ls, 3)
+                    self._vnd_or_opt_inplace(c_pop[idx], D_ls, knn_idx, dlb_mask, exploit_ls, 3, main_pos_buffer, main_tour_buffer)
                     c_fit[idx] = tour_length_jit(c_pop[idx], D)
 
                 cur_best_idx = np.argmin(fitness)
@@ -940,17 +1041,17 @@ class r0927480:
         finally:
             if scout_process.is_alive(): scout_process.terminate(); scout_process.join()
 
-    def _vnd_or_opt_inplace(self, tour, D, knn_idx, dlb_mask, max_iters, block_steps):
+    def _vnd_or_opt_inplace(self, tour, D, knn_idx, dlb_mask, max_iters, block_steps, pos_buf, tour_buf):
         improved = True
         while improved:
             improved = False; dlb_mask[:] = False
-            if _candidate_or_opt_jit(tour, D, knn_idx, max_iters=max_iters, dlb_mask=dlb_mask, block_size=1): improved = True; continue
+            if _candidate_or_opt_jit(tour, D, knn_idx, pos_buf, tour_buf, max_iters, dlb_mask, 1): improved = True; continue
             dlb_mask[:] = False
-            if _candidate_block_swap_jit(tour, D, knn_idx, max_iters=block_steps, dlb_mask=dlb_mask, block_size=2): improved = True; continue
+            if _candidate_block_swap_jit(tour, D, knn_idx, pos_buf, tour_buf, block_steps, dlb_mask, 2): improved = True; continue
             dlb_mask[:] = False
-            if _candidate_or_opt_jit(tour, D, knn_idx, max_iters=block_steps, dlb_mask=dlb_mask, block_size=2): improved = True; continue
+            if _candidate_or_opt_jit(tour, D, knn_idx, pos_buf, tour_buf, block_steps, dlb_mask, 2): improved = True; continue
             dlb_mask[:] = False
-            if _candidate_or_opt_jit(tour, D, knn_idx, max_iters=block_steps, dlb_mask=dlb_mask, block_size=3): improved = True; continue
+            if _candidate_or_opt_jit(tour, D, knn_idx, pos_buf, tour_buf, block_steps, dlb_mask, 3): improved = True; continue
 
     def _gls_update_penalties(self, tour, D, penalties):
         n, max_util = tour.shape[0], -1.0
