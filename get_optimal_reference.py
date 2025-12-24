@@ -53,7 +53,7 @@ def method_ortools(D):
         print("  OR-Tools 未安装，运行: pip install ortools")
         return None
 
-def method_elkai(D, precision=100, runs=10):
+def method_elkai(D, precision=1, runs=10):
     """
     使用 elkai 库（LKH 的 Python 绑定）
     
@@ -82,7 +82,7 @@ def method_elkai(D, precision=100, runs=10):
             max_val = 1.0  # 全是 inf 的极端情况
         
         # Big M = max_val * 1000，确保走一条 inf 边的代价超过绕行所有城市的总和
-        big_m = max_val * 1000
+        big_m = max_val * 100
         D_copy[~finite_mask] = big_m
         
         # 2. 缩放并转为整数 (解决浮点数精度问题)
@@ -126,12 +126,38 @@ def method_python_tsp(D):
         print("  python-tsp 未安装，运行: pip install python-tsp")
         return None
 
+def check_path_validity(D, path):
+    """
+    验证路径是否包含不可达的边（inf 值）
+    
+    Args:
+        D: 原始距离矩阵
+        path: 路径节点列表
+    
+    Returns:
+        (is_valid, error_edge): 是否有效，如果无效返回故障边
+    """
+    for i in range(len(path)):
+        u, v = path[i], path[(i + 1) % len(path)]
+        if not np.isfinite(D[u, v]):
+            return False, (u, v)
+    return True, None
+
+
+def save_route_to_file(route, filename):
+    """保存路径到文件"""
+    with open(filename, "w") as f:
+        for node in route:
+            f.write(f"{node}\n")
+    print(f"  📁 路径已保存至: {filename}")
+
+
 def main():
     print("=" * 60)
     print("TSP 最优解参考值获取")
     print("=" * 60)
     
-    csv_files = [ "tour750.csv", "tour1000.csv"]
+    csv_files = ["tour750.csv", "tour1000.csv"]
     
     for filename in csv_files:
         try:
@@ -152,9 +178,28 @@ def main():
             # 方法 2: elkai (LKH) - 使用 DistanceMatrix + Big M 法
             print("  elkai (LKH, runs=10)...", end=" ", flush=True)
             t0 = time.time()
-            result_elkai, route_elkai = method_elkai(D, precision=100, runs=10)
+            result_elkai, route_elkai = method_elkai(D, precision=1, runs=10)
             if result_elkai is not None:
                 print(f"✓ {result_elkai:.2f} ({time.time()-t0:.1f}s)")
+                
+                # 验证路径是否有效（不包含 inf 边）
+                is_valid, error_edge = check_path_validity(D, route_elkai)
+                if is_valid:
+                    print("  ✅ 路径验证通过（无不可达边）")
+                else:
+                    print(f"  ⚠️ 警告：路径包含不可达边！从 {error_edge[0]} 到 {error_edge[1]}")
+                
+                # 显示路径预览（前10个和后10个节点）
+                if len(route_elkai) > 20:
+                    preview = route_elkai[:10] + ["..."] + route_elkai[-10:]
+                else:
+                    preview = route_elkai
+                print(f"  🛤️  路径预览: {preview}")
+                
+                # 保存路径到文件
+                base_name = filename.replace(".csv", "")
+                route_filename = f"best_route_{base_name}.txt"
+                save_route_to_file(route_elkai, route_filename)
             else:
                 print("✗")
             
