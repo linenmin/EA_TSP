@@ -13,6 +13,7 @@ import multiprocessing
 import queue
 import time
 from numba import njit, prange, set_num_threads
+from scipy.optimize import linear_sum_assignment
 
 try:
     set_num_threads(1)
@@ -76,6 +77,836 @@ def build_knn_idx(D, finite_mask, K):
         for t in range(m):
             knn[i, t] = valid_indices[order[t]]
     return knn
+
+def compute_alpha_candidates(D, finite_mask, K_alpha=30):
+    """
+    计算 α-nearness 候选边集（使用 Assignment Relaxation）
+    
+    α(i,j) = c_ij - u_i - v_j
+    u_i, v_j 是对偶变量（势函数），近似使用行/列最小值
+    
+    输入:
+        D: 距离矩阵 (n x n)
+        finite_mask: 可行边掩码
+        K_alpha: 每个点选 α 最小的 K_alpha 个候选
+    
+    输出:
+        candidates: (n, K_alpha) 候选边数组
+    """
+    n = D.shape[0]
+    
+    # 处理 inf：用大值替代
+    D_safe = D.copy()
+    max_val = np.nanmax(D_safe[np.isfinite(D_safe)]) * 10 if np.any(np.isfinite(D_safe)) else 1e10
+    D_safe[~np.isfinite(D_safe)] = max_val
+    np.fill_diagonal(D_safe, max_val)  # 对角线设为大值
+    
+    # 计算势函数 u, v（简化：使用行/列最小值近似对偶变量）
+    u = np.min(D_safe, axis=1)  # 每行最小
+    v = np.min(D_safe, axis=0)  # 每列最小
+    
+    # 计算约化代价 α
+    alpha = D_safe - u[:, None] - v[None, :]
+    
+    # 将 inf 位置的 α 设为大值
+    alpha[~finite_mask] = max_val
+    np.fill_diagonal(alpha, max_val)
+    
+    # 每个点选 α 最小的 K_alpha 个
+    candidates = np.full((n, K_alpha), -1, dtype=np.int32)
+    for i in range(n):
+        order = np.argsort(alpha[i])
+        count = 0
+        for j in order:
+            if count >= K_alpha:
+                break
+            if j != i and finite_mask[i, j]:
+                candidates[i, count] = j
+                count += 1
+    
+    return candidates
+
+@njit(cache=True, fastmath=True)
+def merge_candidates(knn, alpha_cand, D, max_size=50):
+    """
+    合并 KNN 候选和 α-nearness 候选，按距离排序
+    
+    输入:
+        knn: (n, K1) KNN 候选
+        alpha_cand: (n, K2) α-nearness 候选
+        D: 距离矩阵
+        max_size: 合并后每个点最多保留的候选数
+    
+    输出:
+        merged: (n, max_size) 合并后的候选边（按距离排序）
+    """
+    n = knn.shape[0]
+    K1 = knn.shape[1]
+    K2 = alpha_cand.shape[1]
+    
+    merged = np.full((n, max_size), -1, dtype=np.int32)
+    
+    for i in range(n):
+        # 收集所有候选（去重）
+        seen = np.zeros(n, dtype=np.uint8)
+        temp_cand = np.empty(K1 + K2, dtype=np.int32)
+        temp_dist = np.empty(K1 + K2, dtype=np.float64)
+        count = 0
+        
+        # 添加 KNN 候选
+        for k in range(K1):
+            j = knn[i, k]
+            if j != -1 and seen[j] == 0:
+                seen[j] = 1
+                temp_cand[count] = j
+                temp_dist[count] = D[i, j]
+                count += 1
+        
+        # 添加 α-nearness 候选
+        for k in range(K2):
+            j = alpha_cand[i, k]
+            if j != -1 and seen[j] == 0:
+                seen[j] = 1
+                temp_cand[count] = j
+                temp_dist[count] = D[i, j]
+                count += 1
+        
+        # 按距离排序
+        if count > 0:
+            order = np.argsort(temp_dist[:count])
+            for t in range(min(count, max_size)):
+                merged[i, t] = temp_cand[order[t]]
+    
+    return merged
+
+# ==============================================================================
+# LK/LKH 核心函数 (Lin-Kernighan 局部搜索)
+# ==============================================================================
+
+@njit(cache=True, fastmath=True)
+def _tour_to_adjacency(tour, succ, pred, pos):
+    """将排列 tour 转换为邻接表示 succ/pred/pos"""
+    n = len(tour)
+    for i in range(n):
+        city = tour[i]
+        pos[city] = i                    # 城市在 tour 中的位置
+        succ[city] = tour[(i + 1) % n]   # 城市的后继
+        pred[city] = tour[(i - 1) % n]   # 城市的前驱
+
+@njit(cache=True, fastmath=True)
+def _adjacency_to_tour(succ, tour, start=0):
+    """将邻接表示转换回排列 tour"""
+    n = len(tour)
+    tour[0] = start
+    for i in range(1, n):
+        tour[i] = succ[tour[i-1]]
+
+@njit(cache=True, fastmath=True)
+def _flip_segment(succ, pred, a, b):
+    """翻转从 a 到 b 的路径段（用于 2-opt 类型的 move）"""
+    # 收集段中的节点
+    curr = a
+    count = 0
+    while curr != b and count < 10000:
+        next_node = succ[curr]
+        # 交换 succ 和 pred
+        succ[curr], pred[curr] = pred[curr], succ[curr]
+        curr = next_node
+        count += 1
+    # 处理最后一个节点 b
+    succ[b], pred[b] = pred[b], succ[b]
+
+@njit(cache=True, fastmath=True)
+def _lk_try_move(t1, succ, pred, pos, D, candidates, max_depth, branch_limit):
+    """
+    从 t1 出发尝试找一个改进的 LK move
+    
+    返回: (gain, 是否找到改进, 需要执行的 move 信息)
+    """
+    n = len(succ)
+    K = candidates.shape[1]
+    
+    # t2 是 t1 的后继，第一条要断的边是 (t1, t2)
+    t2 = succ[t1]
+    x1_cost = D[t1, t2]  # 断边代价
+    
+    # 遍历候选边 (t2, t3) 作为第一条加边
+    for k in range(min(K, branch_limit)):
+        t3 = candidates[t2, k]
+        if t3 == -1 or t3 == t1 or t3 == t2:
+            continue
+        if not np.isfinite(D[t2, t3]):
+            continue
+            
+        y1_cost = D[t2, t3]  # 加边代价
+        G1 = x1_cost - y1_cost  # 第一步增益
+        
+        if G1 <= 0:  # 必须有正增益潜力
+            continue
+        
+        # t4 是 t3 的后继，第二条断边是 (t3, t4)
+        t4 = succ[t3]
+        if t4 == t1:  # 可以直接闭合
+            # 闭合增益：不需要加闭合边（因为闭合边就是 (t4, t1) = (succ[t3], t1)）
+            # 实际上闭合需要检查
+            continue  # 两步太短，继续找更深的
+        
+        x2_cost = D[t3, t4]  # 第二条断边代价
+        
+        # 尝试闭合：加边 (t4, t1)
+        close_cost = D[t4, t1]
+        if np.isfinite(close_cost):
+            total_gain = G1 + x2_cost - close_cost
+            if total_gain > 1e-9:
+                # 找到改进！返回 2-opt 类型的 move
+                return total_gain, True, t1, t2, t3, t4
+        
+        # 如果不能闭合，继续扩展到更深层
+        G2 = G1 + x2_cost
+        
+        # 第二层：选择 y2 = (t4, t5)
+        for k2 in range(min(K, branch_limit // 2)):
+            t5 = candidates[t4, k2]
+            if t5 == -1 or t5 == t1 or t5 == t2 or t5 == t3 or t5 == t4:
+                continue
+            if not np.isfinite(D[t4, t5]):
+                continue
+            
+            y2_cost = D[t4, t5]
+            if G2 - y2_cost <= 0:
+                continue
+            
+            t6 = succ[t5]
+            x3_cost = D[t5, t6]
+            
+            # 尝试 3-opt 闭合
+            close_cost = D[t6, t1]
+            if np.isfinite(close_cost):
+                total_gain = G2 - y2_cost + x3_cost - close_cost
+                if total_gain > 1e-9:
+                    return total_gain, True, t1, t2, t3, t4  # 简化：返回 2-opt 部分
+    
+    return 0.0, False, -1, -1, -1, -1
+
+@njit(cache=True, fastmath=True)
+def _apply_2opt_move(tour, pos, i, j):
+    """应用 2-opt move：翻转 tour[i+1:j+1]"""
+    n = len(tour)
+    # 翻转区间 [i+1, j]
+    left = i + 1
+    right = j
+    while left < right:
+        # 交换
+        tmp = tour[left]
+        tour[left] = tour[right]
+        tour[right] = tmp
+        # 更新位置
+        pos[tour[left]] = left
+        pos[tour[right]] = right
+        left += 1
+        right -= 1
+    # 如果 left == right（奇数个元素），更新中间元素的位置
+    if left == right:
+        pos[tour[left]] = left
+
+@njit(cache=True, fastmath=True)
+def _lk_search(tour, D, candidates, max_depth=5, branch_limit=8, max_iters=1000):
+    """
+    Lin-Kernighan 局部搜索（简化版，基于排列表示）
+    
+    输入:
+        tour: 当前 tour（排列表示，会被原地修改）
+        D: 距离矩阵
+        candidates: 候选边集
+        max_depth: 最大搜索深度
+        branch_limit: 每层最大分支数
+        max_iters: 最大迭代次数
+    
+    输出:
+        total_gain: 累计改进量
+    """
+    n = len(tour)
+    K = candidates.shape[1]
+    
+    # 预分配位置数组
+    pos = np.empty(n, np.int32)
+    for i in range(n):
+        pos[tour[i]] = i
+    
+    total_gain = 0.0
+    improved = True
+    iteration = 0
+    
+    while improved and iteration < max_iters:
+        improved = False
+        iteration += 1
+        
+        # 尝试每个起点（随机顺序）
+        start_offset = np.random.randint(0, n)
+        
+        for offset in range(n):
+            i = (start_offset + offset) % n
+            
+            # 边 (tour[i], tour[i+1])
+            u = tour[i]
+            v = tour[(i + 1) % n]
+            
+            if not np.isfinite(D[u, v]):
+                continue
+            
+            old_edge_cost = D[u, v]
+            best_gain = 0.0
+            best_j = -1
+            
+            # 从候选集中找改进的 2-opt move
+            for k in range(K):
+                cand = candidates[u, k]
+                if cand == -1:
+                    break
+                
+                j = pos[cand]  # cand 在 tour 中的位置
+                
+                # 2-opt: 断 (i, i+1) 和 (j, j+1)，连 (i, j) 和 (i+1, j+1)
+                if j <= i + 1 or j >= n - 1:
+                    continue
+                
+                c = tour[j]
+                d = tour[(j + 1) % n]
+                
+                if not np.isfinite(D[c, d]) or not np.isfinite(D[u, c]) or not np.isfinite(D[v, d]):
+                    continue
+                
+                # 计算增益
+                gain = (D[u, v] + D[c, d]) - (D[u, c] + D[v, d])
+                
+                if gain > best_gain + 1e-9:
+                    best_gain = gain
+                    best_j = j
+            
+            if best_j > 0:
+                # 应用 2-opt move
+                _apply_2opt_move(tour, pos, i, best_j)
+                total_gain += best_gain
+                improved = True
+                break  # First improvement
+    
+    return total_gain
+
+@njit(cache=True, fastmath=True)
+def _edge_hash(u, v, n):
+    """计算边的哈希值（用于 Tabu 表索引）"""
+    return (u * n + v) % 10007  # 素数模
+
+@njit(cache=True, fastmath=True)
+def _lk_search_tabu(tour, D, candidates, tabu_tenure=7, max_depth=5, branch_limit=8, max_iters=1000):
+    """
+    带 Tabu 短期记忆的 Lin-Kernighan 局部搜索
+    
+    Tabu 机制:
+        - 当一条边被移除时，记录到禁忌表
+        - 在 tabu_tenure 次迭代内，禁止将该边重新加入
+        - 允许"渴望准则"：如果移动产生的增益超过阈值，可忽略禁忌
+    
+    输入:
+        tour: 当前 tour（排列表示，会被原地修改）
+        D: 距离矩阵（可含 GLS 惩罚）
+        candidates: 候选边集
+        tabu_tenure: 禁忌期限（迭代次数）
+        max_depth, branch_limit, max_iters: LK 搜索参数
+    
+    输出:
+        total_gain: 累计改进量
+    """
+    n = len(tour)
+    K = candidates.shape[1]
+    
+    # 预分配位置数组
+    pos = np.empty(n, np.int32)
+    for i in range(n):
+        pos[tour[i]] = i
+    
+    # Tabu 表：存储边被禁忌的迭代号（禁到第几轮）
+    # 使用哈希表简化：tabu_until[hash(u,v)] = 禁到第几轮
+    TABU_SIZE = 10007  # 素数大小
+    tabu_until = np.zeros(TABU_SIZE, np.int32)
+    
+    total_gain = 0.0
+    improved = True
+    iteration = 0
+    best_known = tour_length_jit(tour, D)  # 用于渴望准则
+    aspiration_threshold = best_known * 0.001  # 0.1% 的改进可忽略禁忌
+    
+    while improved and iteration < max_iters:
+        improved = False
+        iteration += 1
+        
+        # 尝试每个起点（随机顺序）
+        start_offset = np.random.randint(0, n)
+        
+        for offset in range(n):
+            i = (start_offset + offset) % n
+            
+            # 边 (tour[i], tour[i+1])
+            u = tour[i]
+            v = tour[(i + 1) % n]
+            
+            if not np.isfinite(D[u, v]):
+                continue
+            
+            best_gain = 0.0
+            best_j = -1
+            is_tabu_move = False
+            
+            # 从候选集中找改进的 2-opt move
+            for k in range(K):
+                cand = candidates[u, k]
+                if cand == -1:
+                    break
+                
+                j = pos[cand]
+                
+                # 2-opt 约束
+                if j <= i + 1 or j >= n - 1:
+                    continue
+                
+                c = tour[j]
+                d = tour[(j + 1) % n]
+                
+                if not np.isfinite(D[c, d]) or not np.isfinite(D[u, c]) or not np.isfinite(D[v, d]):
+                    continue
+                
+                # 检查新边是否被禁忌
+                # 新边: (u, c) 和 (v, d)
+                h1 = _edge_hash(u, c, n)
+                h2 = _edge_hash(v, d, n)
+                is_tabu = (tabu_until[h1] >= iteration) or (tabu_until[h2] >= iteration)
+                
+                # 计算增益
+                gain = (D[u, v] + D[c, d]) - (D[u, c] + D[v, d])
+                
+                if gain > best_gain + 1e-9:
+                    # 检查渴望准则：如果增益足够大，可忽略禁忌
+                    if is_tabu and gain < aspiration_threshold:
+                        continue  # 被禁忌且增益不够大，跳过
+                    
+                    best_gain = gain
+                    best_j = j
+                    is_tabu_move = is_tabu
+            
+            if best_j > 0:
+                # 记录被移除的边到禁忌表
+                old_c = tour[best_j]
+                old_d = tour[(best_j + 1) % n]
+                
+                # 禁止 (u, v) 和 (c, d) 重新加入
+                h_uv = _edge_hash(u, v, n)
+                h_cd = _edge_hash(old_c, old_d, n)
+                tabu_until[h_uv] = iteration + tabu_tenure
+                tabu_until[h_cd] = iteration + tabu_tenure
+                
+                # 应用 2-opt move
+                _apply_2opt_move(tour, pos, i, best_j)
+                total_gain += best_gain
+                improved = True
+                
+                # 更新渴望阈值
+                current_len = best_known - total_gain
+                aspiration_threshold = current_len * 0.001
+                
+                break  # First improvement
+    
+    return total_gain
+
+@njit(cache=True, fastmath=True)
+def _apply_3opt_move(tour, pos, i, j, k, move_type):
+    """
+    应用 3-opt move：断开 (i,i+1), (j,j+1), (k,k+1) 并重新连接
+    
+    move_type 决定重连方式：
+        0: [0..i] + [j+1..k] + [i+1..j] + [k+1..n]  (段交换)
+        1: [0..i] + [j+1..k]^r + [i+1..j] + [k+1..n]  (带反转)
+        2: [0..i] + [i+1..j]^r + [j+1..k]^r + [k+1..n]  (双反转)
+    
+    输入:
+        tour: 当前 tour
+        pos: 位置数组
+        i, j, k: 三个断点位置（i < j < k）
+        move_type: 重连类型
+    """
+    n = len(tour)
+    temp = np.empty(n, np.int32)
+    ptr = 0
+    
+    if move_type == 0:
+        # 段交换：[0..i] + [j+1..k] + [i+1..j] + [k+1..n]
+        for t in range(0, i + 1):
+            temp[ptr] = tour[t]; ptr += 1
+        for t in range(j + 1, k + 1):
+            temp[ptr] = tour[t]; ptr += 1
+        for t in range(i + 1, j + 1):
+            temp[ptr] = tour[t]; ptr += 1
+        for t in range(k + 1, n):
+            temp[ptr] = tour[t]; ptr += 1
+    elif move_type == 1:
+        # 带反转：[0..i] + [j+1..k]^r + [i+1..j] + [k+1..n]
+        for t in range(0, i + 1):
+            temp[ptr] = tour[t]; ptr += 1
+        for t in range(k, j, -1):  # 反转 [j+1..k]
+            temp[ptr] = tour[t]; ptr += 1
+        for t in range(i + 1, j + 1):
+            temp[ptr] = tour[t]; ptr += 1
+        for t in range(k + 1, n):
+            temp[ptr] = tour[t]; ptr += 1
+    elif move_type == 2:
+        # 双反转：[0..i] + [i+1..j]^r + [j+1..k]^r + [k+1..n]
+        for t in range(0, i + 1):
+            temp[ptr] = tour[t]; ptr += 1
+        for t in range(j, i, -1):  # 反转 [i+1..j]
+            temp[ptr] = tour[t]; ptr += 1
+        for t in range(k, j, -1):  # 反转 [j+1..k]
+            temp[ptr] = tour[t]; ptr += 1
+        for t in range(k + 1, n):
+            temp[ptr] = tour[t]; ptr += 1
+    
+    # 拷回并更新 pos
+    for t in range(n):
+        tour[t] = temp[t]
+        pos[temp[t]] = t
+
+@njit(cache=True, fastmath=True)
+def _try_3opt_move(tour, pos, D, candidates, tabu_until, iteration, aspiration_threshold):
+    """
+    尝试找一个改进的 3-opt move（非顺序移动）
+    
+    返回: (gain, found, i, j, k, move_type)
+    """
+    n = len(tour)
+    K = candidates.shape[1]
+    
+    best_gain = 0.0
+    best_i, best_j, best_k, best_type = -1, -1, -1, -1
+    
+    # 随机选择起点
+    start = np.random.randint(0, n)
+    
+    # 限制搜索范围（3-opt 很慢，只搜索部分）
+    max_tries = min(n // 2, 100)
+    
+    for offset in range(max_tries):
+        i = (start + offset) % (n - 5)
+        if i < 0: continue
+        
+        # 第一条边 (tour[i], tour[i+1])
+        a, b = tour[i], tour[i + 1]
+        if not np.isfinite(D[a, b]):
+            continue
+        
+        # 从候选集中选 j
+        for k1 in range(min(K, 10)):
+            cand1 = candidates[b, k1]
+            if cand1 == -1:
+                break
+            
+            j = pos[cand1]
+            if j <= i + 1 or j >= n - 3:
+                continue
+            
+            # 第二条边 (tour[j], tour[j+1])
+            c, d = tour[j], tour[j + 1]
+            if not np.isfinite(D[c, d]):
+                continue
+            
+            # 从候选集中选 k
+            for k2 in range(min(K, 8)):
+                cand2 = candidates[d, k2]
+                if cand2 == -1:
+                    break
+                
+                k = pos[cand2]
+                if k <= j + 1 or k >= n - 1:
+                    continue
+                
+                # 第三条边 (tour[k], tour[k+1])
+                e, f = tour[k], tour[(k + 1) % n]
+                if not np.isfinite(D[e, f]):
+                    continue
+                
+                # 计算原始代价
+                old_cost = D[a, b] + D[c, d] + D[e, f]
+                
+                # 尝试不同的重连方式
+                # move_type 0: 段交换
+                # 新边: (a, d), (c, b), (e, f) 变为 (a, d), (e, b), (c, f)
+                # 这里简化为只检查一种有效的 3-opt
+                
+                # 简化的 3-opt：交换中间两段
+                # 新边: (a, d), (e, b), (c, f)
+                if np.isfinite(D[a, d]) and np.isfinite(D[e, b]) and np.isfinite(D[c, f]):
+                    new_cost = D[a, d] + D[e, b] + D[c, f]
+                    gain = old_cost - new_cost
+                    
+                    if gain > best_gain + 1e-9:
+                        # 检查禁忌
+                        h1 = _edge_hash(a, d, n)
+                        h2 = _edge_hash(e, b, n)
+                        h3 = _edge_hash(c, f, n)
+                        is_tabu = (tabu_until[h1] >= iteration) or \
+                                  (tabu_until[h2] >= iteration) or \
+                                  (tabu_until[h3] >= iteration)
+                        
+                        if is_tabu and gain < aspiration_threshold:
+                            continue
+                        
+                        best_gain = gain
+                        best_i, best_j, best_k, best_type = i, j, k, 0
+    
+    return best_gain, (best_i >= 0), best_i, best_j, best_k, best_type
+
+@njit(cache=True, fastmath=True)
+def _lk_search_enhanced(tour, D, candidates, tabu_tenure=7, max_depth=5, branch_limit=8, max_iters=1000, use_3opt=True):
+    """
+    增强版 LK 搜索：2-opt + Tabu + 可选 3-opt（非顺序移动）
+    
+    当 2-opt 找不到改进时，尝试 3-opt 非顺序移动
+    """
+    n = len(tour)
+    K = candidates.shape[1]
+    
+    # 预分配位置数组
+    pos = np.empty(n, np.int32)
+    for i in range(n):
+        pos[tour[i]] = i
+    
+    # Tabu 表
+    TABU_SIZE = 10007
+    tabu_until = np.zeros(TABU_SIZE, np.int32)
+    
+    total_gain = 0.0
+    improved = True
+    iteration = 0
+    best_known = tour_length_jit(tour, D)
+    aspiration_threshold = best_known * 0.001
+    
+    no_2opt_count = 0  # 连续无 2-opt 改进计数
+    
+    while improved and iteration < max_iters:
+        improved = False
+        iteration += 1
+        
+        # 尝试 2-opt
+        start_offset = np.random.randint(0, n)
+        found_2opt = False
+        
+        for offset in range(n):
+            i = (start_offset + offset) % n
+            
+            u = tour[i]
+            v = tour[(i + 1) % n]
+            
+            if not np.isfinite(D[u, v]):
+                continue
+            
+            best_gain_2opt = 0.0
+            best_j = -1
+            
+            for k in range(K):
+                cand = candidates[u, k]
+                if cand == -1:
+                    break
+                
+                j = pos[cand]
+                if j <= i + 1 or j >= n - 1:
+                    continue
+                
+                c = tour[j]
+                d = tour[(j + 1) % n]
+                
+                if not np.isfinite(D[c, d]) or not np.isfinite(D[u, c]) or not np.isfinite(D[v, d]):
+                    continue
+                
+                h1 = _edge_hash(u, c, n)
+                h2 = _edge_hash(v, d, n)
+                is_tabu = (tabu_until[h1] >= iteration) or (tabu_until[h2] >= iteration)
+                
+                gain = (D[u, v] + D[c, d]) - (D[u, c] + D[v, d])
+                
+                if gain > best_gain_2opt + 1e-9:
+                    if is_tabu and gain < aspiration_threshold:
+                        continue
+                    best_gain_2opt = gain
+                    best_j = j
+            
+            if best_j > 0:
+                old_c = tour[best_j]
+                old_d = tour[(best_j + 1) % n]
+                
+                h_uv = _edge_hash(u, v, n)
+                h_cd = _edge_hash(old_c, old_d, n)
+                tabu_until[h_uv] = iteration + tabu_tenure
+                tabu_until[h_cd] = iteration + tabu_tenure
+                
+                _apply_2opt_move(tour, pos, i, best_j)
+                total_gain += best_gain_2opt
+                improved = True
+                found_2opt = True
+                no_2opt_count = 0
+                
+                current_len = best_known - total_gain
+                aspiration_threshold = current_len * 0.001
+                break
+        
+        # 如果 2-opt 找不到改进，尝试 3-opt
+        if not found_2opt and use_3opt:
+            no_2opt_count += 1
+            
+            # 每隔几次尝试 3-opt
+            if no_2opt_count >= 3:
+                gain_3opt, found, i3, j3, k3, move_type = _try_3opt_move(
+                    tour, pos, D, candidates, tabu_until, iteration, aspiration_threshold
+                )
+                
+                if found and gain_3opt > 1e-9:
+                    # 记录被移除的边到禁忌表
+                    a, b = tour[i3], tour[i3 + 1]
+                    c, d = tour[j3], tour[j3 + 1]
+                    e, f = tour[k3], tour[(k3 + 1) % n]
+                    
+                    tabu_until[_edge_hash(a, b, n)] = iteration + tabu_tenure
+                    tabu_until[_edge_hash(c, d, n)] = iteration + tabu_tenure
+                    tabu_until[_edge_hash(e, f, n)] = iteration + tabu_tenure
+                    
+                    _apply_3opt_move(tour, pos, i3, j3, k3, move_type)
+                    total_gain += gain_3opt
+                    improved = True
+                    no_2opt_count = 0
+                    
+                    current_len = best_known - total_gain
+                    aspiration_threshold = current_len * 0.001
+    
+    return total_gain
+
+
+@njit(cache=True, fastmath=True)
+def _or_opt_move_fast(tour, pos, D, candidates, block_size=1):
+    """快速 Or-opt：移动一个 block 到更好的位置"""
+    n = len(tour)
+    K = candidates.shape[1]
+    
+    best_gain = 0.0
+    best_u_idx = -1
+    best_t_idx = -1
+    
+    for u_idx in range(n - block_size):
+        u = tour[u_idx]
+        
+        # block 的边界
+        prev_idx = (u_idx - 1) % n
+        post_idx = (u_idx + block_size) % n
+        
+        prev_u = tour[prev_idx]
+        block_tail = tour[u_idx + block_size - 1]
+        next_after = tour[post_idx]
+        
+        if not np.isfinite(D[prev_u, u]) or not np.isfinite(D[block_tail, next_after]):
+            continue
+        if not np.isfinite(D[prev_u, next_after]):
+            continue
+        
+        remove_cost = D[prev_u, u] + D[block_tail, next_after]
+        new_edge = D[prev_u, next_after]
+        
+        # 从候选集中找插入位置
+        for k in range(K):
+            target = candidates[u, k]
+            if target == -1:
+                break
+            
+            t_idx = pos[target]
+            if t_idx >= u_idx and t_idx < u_idx + block_size:
+                continue
+            if t_idx == prev_idx:
+                continue
+            
+            target_next_idx = (t_idx + 1) % n
+            target_next = tour[target_next_idx]
+            
+            if not np.isfinite(D[target, target_next]):
+                continue
+            if not np.isfinite(D[target, u]) or not np.isfinite(D[block_tail, target_next]):
+                continue
+            
+            insert_cost = D[target, u] + D[block_tail, target_next]
+            old_edge = D[target, target_next]
+            gain = (remove_cost - new_edge) + (old_edge - insert_cost)
+            
+            if gain > best_gain + 1e-9:
+                best_gain = gain
+                best_u_idx = u_idx
+                best_t_idx = t_idx
+    
+    return best_gain, best_u_idx, best_t_idx
+
+@njit(cache=True, fastmath=True)
+def iterated_lk(tour, D, candidates, max_kicks=10, lk_depth=5, lk_branch=8, lk_iters=500, tabu_tenure=7, use_3opt=True):
+    """
+    Iterated Lin-Kernighan (ILK) + Tabu + 3-opt 非顺序移动
+    
+    循环:
+        1. LK（带 Tabu + 可选 3-opt）跑到无改进
+        2. kick（double-bridge）
+        3. 再 LK 到无改进
+        4. 记录 best，重复直到 max_kicks 次无提升
+    
+    输入:
+        tour: 初始 tour（会被修改）
+        D: 距离矩阵
+        candidates: 候选边集
+        max_kicks: 最大 kick 次数
+        lk_depth: LK 搜索深度
+        lk_branch: LK 分支限制
+        lk_iters: 每轮 LK 最大迭代次数
+        tabu_tenure: Tabu 禁忌期限
+        use_3opt: 是否启用 3-opt 非顺序移动
+    
+    输出:
+        best_tour: 找到的最优 tour
+        best_length: 最优 tour 长度
+    """
+    n = len(tour)
+    
+    # 初始 LK 优化（使用增强版：2-opt + Tabu + 3-opt）
+    _lk_search_enhanced(tour, D, candidates, tabu_tenure, lk_depth, lk_branch, lk_iters, use_3opt)
+    
+    best_length = tour_length_jit(tour, D)
+    best_tour = tour.copy()
+    
+    no_improve_count = 0
+    
+    for kick_iter in range(max_kicks):
+        # Kick: double-bridge 扰动
+        kicked_tour = double_bridge_move(tour)
+        
+        # LK 优化扰动后的 tour（使用增强版）
+        _lk_search_enhanced(kicked_tour, D, candidates, tabu_tenure, lk_depth, lk_branch, lk_iters, use_3opt)
+        
+        current_length = tour_length_jit(kicked_tour, D)
+        
+        if current_length < best_length - 1e-9:
+            best_length = current_length
+            best_tour[:] = kicked_tour[:]
+            tour[:] = kicked_tour[:]
+            no_improve_count = 0
+        else:
+            no_improve_count += 1
+            # 有概率接受较差解（避免陷入）
+            if np.random.rand() < 0.3:
+                tour[:] = kicked_tour[:]
+            if no_improve_count >= 3:
+                break
+    
+    return best_tour, best_length
+
+
 
 @njit(cache=True, fastmath=True)
 def _tour_feasible_jit(tour, finite_mask):
@@ -841,6 +1672,23 @@ def scout_worker(D, q_in, q_out, is_symmetric):
         rr_tour_buffer = np.empty(n, dtype=np.int32)  # Ruin & Recreate 专用
         rr_removed_buffer = np.empty(n, dtype=np.int32)
         
+        # =====================================================
+        # ALNS 自适应权重机制
+        # =====================================================
+        # 3 个 destroy 操作: 0=BFS, 1=Sequence, 2=Worst Edge
+        num_operators = 3
+        op_weights = np.array([1.0, 1.0, 1.0])  # 初始权重相等
+        op_scores = np.zeros(num_operators)      # 累计得分
+        op_usage = np.zeros(num_operators)       # 使用次数
+        
+        # ALNS 参数
+        score_new_best = 10.0      # 发现新最优
+        score_improvement = 4.0   # 比当前解更好
+        score_accepted = 1.0      # 被接受（但不是更好）
+        decay_factor = 0.8        # 权重衰减因子
+        min_weight = 0.1          # 最小权重（避免操作被完全忽略）
+        update_period = 100       # 每隔多少次迭代更新权重
+        
         while True:
             iter_count += 1
             try:
@@ -852,15 +1700,24 @@ def scout_worker(D, q_in, q_out, is_symmetric):
             
             ruin_pct = ruin_gears[int((iter_count - last_improv_iter) // 250) % 10]
             
+            # ALNS: 根据自适应权重选择 destroy 操作
+            total_weight = op_weights.sum()
+            probs = op_weights / total_weight
             rand_val = np.random.rand()
-            if rand_val < 0.7: mode = 0
-            elif rand_val < 0.9: mode = 2
-            else: mode = 1
+            if rand_val < probs[0]:
+                mode = 0  # BFS
+            elif rand_val < probs[0] + probs[1]:
+                mode = 1  # Sequence
+            else:
+                mode = 2  # Worst Edge
+            
+            op_usage[mode] += 1
             
             # 使用原地版 Ruin & Recreate
             _hybrid_ruin_and_recreate_inplace(current_tour, D, ruin_pct, knn_idx, mode, rr_tour_buffer, rr_removed_buffer)
             candidate = rr_tour_buffer  # candidate 现在指向 buffer
             
+            # 使用快速 VND（Scout 需要高频迭代，LK 太慢）
             dlb_mask[:], improved, block_steps = False, True, 10
             while improved:
                 improved = False; dlb_mask[:] = False
@@ -873,7 +1730,16 @@ def scout_worker(D, q_in, q_out, is_symmetric):
                 if _candidate_or_opt_jit(candidate, D, knn_idx, pos_buffer, tour_buffer, block_steps, dlb_mask, 3): improved = True; continue
             
             cand_fit = tour_length_jit(candidate, D); scout_stagnation += 1
-            if cand_fit < best_known_bound: best_known_bound = cand_fit
+            
+            # ALNS: 根据结果更新得分
+            if cand_fit < best_known_bound:
+                op_scores[mode] += score_new_best
+                best_known_bound = cand_fit
+            elif cand_fit < current_fit:
+                op_scores[mode] += score_improvement
+            elif cand_fit <= current_fit * 1.001:  # 接近当前解
+                op_scores[mode] += score_accepted
+            
             gap = (cand_fit - patient_entry_fit) / patient_entry_fit if patient_entry_fit > 0 else 0
             is_breakthrough, tolerance = cand_fit < patient_entry_fit, 0.0
             if scout_stagnation > 500: tolerance = 0.003
@@ -884,6 +1750,18 @@ def scout_worker(D, q_in, q_out, is_symmetric):
                     if is_breakthrough: patient_entry_fit, scout_stagnation, last_improv_iter = cand_fit, 0, iter_count
                 except queue.Full: pass
             if cand_fit <= current_fit: current_tour[:], current_fit = candidate[:], cand_fit
+            
+            # ALNS: 定期更新权重
+            if iter_count % update_period == 0:
+                for op in range(num_operators):
+                    if op_usage[op] > 0:
+                        avg_score = op_scores[op] / op_usage[op]
+                        # 权重 = 衰减后的旧权重 + (1 - 衰减) * 平均得分
+                        op_weights[op] = max(min_weight, 
+                                             decay_factor * op_weights[op] + (1 - decay_factor) * avg_score)
+                # 重置计数器
+                op_scores[:] = 0
+                op_usage[:] = 0
     except Exception: pass
 
 # ==============================================================================
@@ -913,7 +1791,15 @@ class r0927480:
         scout_process.start()
 
         try:
+            # 基础 KNN 候选集
             knn_idx = build_knn_idx(D, finite_mask, 32)
+            
+            # 计算 α-nearness 候选边并合并（增强候选集）
+            K_alpha = 30 if n < 600 else 25  # 根据规模调整
+            alpha_cand = compute_alpha_candidates(D, finite_mask, K_alpha)
+            enhanced_knn = merge_candidates(knn_idx, alpha_cand, D, max_size=50)  # 合并候选
+            print(f"[Init] 候选边集: KNN(32) + Alpha({K_alpha}) -> 合并后(50)")
+            
             gls_penalties, gls_active, D_gls = np.zeros((n, n), dtype=np.int32), False, None
             population = np.empty((lam, n), dtype=np.int32)
             strat_probs = np.array([0.1, 0.3, 0.6], dtype=np.float64)
@@ -944,6 +1830,7 @@ class r0927480:
                     worst_idx = np.argmax(fitness)
                     population[worst_idx][:], fitness[worst_idx] = healed[:], h_fit
                     if h_fit < best_ever_fitness:
+                        print(f"[Gen {gen}] Scout 贡献! {best_ever_fitness:.2f} -> {h_fit:.2f}")
                         best_ever_fitness, stagnation_counter, gls_penalties[:], gls_active = h_fit, 0, 0, False
                 except queue.Empty: pass
 
@@ -952,9 +1839,24 @@ class r0927480:
                 
                 batch_lengths_jit(c_pop, D, c_fit)
                 
+                # 分级局部搜索策略
                 elite_count = max(1, int(lam * 0.2))
                 elite_indices = np.argsort(c_fit)[:elite_count]
-                for idx in elite_indices:
+                
+                # Top 3 精英使用 Iterated LK（强力深挖）
+                top_elite_count = min(3, len(elite_indices))
+                for i in range(top_elite_count):
+                    idx = elite_indices[i]
+                    # 根据问题规模选择参数
+                    kicks = 5 if n < 400 else (3 if n < 700 else 2)
+                    c_pop[idx], c_fit[idx] = iterated_lk(
+                        c_pop[idx], D_ls, enhanced_knn,  # 使用增强候选集
+                        max_kicks=kicks, lk_depth=5, lk_branch=8, lk_iters=300
+                    )
+                
+                # 其余精英使用快速 VND
+                for i in range(top_elite_count, len(elite_indices)):
+                    idx = elite_indices[i]
                     dlb_mask[:] = False
                     self._vnd_or_opt_inplace(c_pop[idx], D_ls, knn_idx, dlb_mask, exploit_ls, 3, main_pos_buffer, main_tour_buffer)
                     c_fit[idx] = tour_length_jit(c_pop[idx], D)
@@ -975,6 +1877,7 @@ class r0927480:
                 
                 # 2. 判定是否打破"历史"最优（用于记录和报告）
                 if bestObjective < best_ever_fitness:
+                    print(f"[Gen {gen}] 新最优! {best_ever_fitness:.2f} -> {bestObjective:.2f} (提升 {best_ever_fitness - bestObjective:.2f})")
                     best_ever_fitness = bestObjective
                     best_tour_ever = population[best_idx].copy()
                     stagnation_counter = 0  # 打破历史记录当然也清零
@@ -985,13 +1888,16 @@ class r0927480:
                     except queue.Full: pass
                 
                 if stagnation_counter >= max(30, int(stagnation_limit * 0.6)):
+                    if not gls_active:
+                        print(f"[Gen {gen}] GLS 激活 (停滞 {stagnation_counter})")
                     gls_active = True
                     if gen % 50 == 0:
                         self._gls_update_penalties(population[best_idx], D, gls_penalties)
                         D_gls = np.ascontiguousarray(D + (0.03 * (bestObjective / n)) * gls_penalties)
                 else: gls_active = False
                 
-                if stagnation_counter >= stagnation_limit:                    
+                if stagnation_counter >= stagnation_limit:
+                    print(f"[Gen {gen}] 重启! 当前最优 {best_ever_fitness:.2f}")
                     # 1. 清空 Scout 发回的旧消息
                     while not q_from_scout.empty():
                         try: q_from_scout.get_nowait()
