@@ -5,7 +5,7 @@
 *.tex
 *.docx
 *.zip
-*.txt
+# *.txt
 *logs
 __pycache__
 *.pyc

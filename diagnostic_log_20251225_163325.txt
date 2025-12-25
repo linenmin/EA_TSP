@@ -1,0 +1,108 @@
+Diagnostic Log - Started at 2025-12-25 16:33:25.020963
+Problem: tour750.csv, Size: 750, Symmetric: False
+Population: 100, Mutation Rate: 0.1
+================================================================================
+
+Gen    50 | SCX_fail:  178 | RCL_fallback:  376 | Mut_infeas:  198 | Feasible_rate: 92.48% | Best: 103995.43
+Gen   100 | SCX_fail:  294 | RCL_fallback:  683 | Mut_infeas:  389 | Feasible_rate: 93.17% | Best: 103844.68
+Gen   150 | SCX_fail:  344 | RCL_fallback:  940 | Mut_infeas:  596 | Feasible_rate: 93.73% | Best: 103595.82
+Gen   200 | SCX_fail:  384 | RCL_fallback: 1178 | Mut_infeas:  794 | Feasible_rate: 94.11% | Best: 103595.82
+Gen   250 | SCX_fail:  413 | RCL_fallback: 1387 | Mut_infeas:  974 | Feasible_rate: 94.45% | Best: 103595.82
+Gen   300 | SCX_fail:  443 | RCL_fallback: 1592 | Mut_infeas: 1149 | Feasible_rate: 94.69% | Best: 103595.82
+Gen   350 | SCX_fail:  476 | RCL_fallback: 1832 | Mut_infeas: 1356 | Feasible_rate: 94.77% | Best: 103582.52
+Gen   400 | SCX_fail:  510 | RCL_fallback: 2092 | Mut_infeas: 1582 | Feasible_rate: 94.77% | Best: 103486.07
+Gen   450 | SCX_fail:  572 | RCL_fallback: 2346 | Mut_infeas: 1774 | Feasible_rate: 94.79% | Best: 103486.07
+Gen   500 | SCX_fail:  637 | RCL_fallback: 2597 | Mut_infeas: 1960 | Feasible_rate: 94.81% | Best: 103486.07
+Gen   550 | SCX_fail:  681 | RCL_fallback: 2851 | Mut_infeas: 2170 | Feasible_rate: 94.82% | Best: 103286.54
+Gen   600 | SCX_fail:  701 | RCL_fallback: 3069 | Mut_infeas: 2368 | Feasible_rate: 94.88% | Best: 103249.61
+Gen   650 | SCX_fail:  920 | RCL_fallback: 3474 | Mut_infeas: 2554 | Feasible_rate: 94.66% | Best: 103221.82
+Gen   700 | SCX_fail: 1425 | RCL_fallback: 4133 | Mut_infeas: 2708 | Feasible_rate: 94.10% | Best: 103221.82
+Gen   750 | SCX_fail: 1979 | RCL_fallback: 4863 | Mut_infeas: 2884 | Feasible_rate: 93.52% | Best: 103221.82
+Gen   800 | SCX_fail: 2517 | RCL_fallback: 5582 | Mut_infeas: 3065 | Feasible_rate: 93.02% | Best: 103221.82
+Gen   850 | SCX_fail: 2986 | RCL_fallback: 6240 | Mut_infeas: 3254 | Feasible_rate: 92.66% | Best: 103162.46
+Gen   900 | SCX_fail: 3066 | RCL_fallback: 6520 | Mut_infeas: 3454 | Feasible_rate: 92.76% | Best: 103162.46
+Gen   950 | SCX_fail: 3106 | RCL_fallback: 6731 | Mut_infeas: 3625 | Feasible_rate: 92.91% | Best: 103162.46
+Gen  1000 | SCX_fail: 3142 | RCL_fallback: 6956 | Mut_infeas: 3814 | Feasible_rate: 93.04% | Best: 103162.46
+Gen  1050 | SCX_fail: 3175 | RCL_fallback: 7174 | Mut_infeas: 3999 | Feasible_rate: 93.17% | Best: 103162.46
+Gen  1100 | SCX_fail: 3200 | RCL_fallback: 7412 | Mut_infeas: 4212 | Feasible_rate: 93.26% | Best: 103162.46
+Gen  1150 | SCX_fail: 3222 | RCL_fallback: 7626 | Mut_infeas: 4404 | Feasible_rate: 93.37% | Best: 103162.46
+Gen  1200 | SCX_fail: 3387 | RCL_fallback: 8000 | Mut_infeas: 4613 | Feasible_rate: 93.33% | Best: 103162.46
+Gen  1250 | SCX_fail: 3546 | RCL_fallback: 8340 | Mut_infeas: 4794 | Feasible_rate: 93.33% | Best: 103162.46
+Gen  1300 | SCX_fail: 3637 | RCL_fallback: 8643 | Mut_infeas: 5006 | Feasible_rate: 93.35% | Best: 103162.46
+Gen  1350 | SCX_fail: 3731 | RCL_fallback: 8935 | Mut_infeas: 5204 | Feasible_rate: 93.38% | Best: 103162.46
+Gen  1400 | SCX_fail: 3799 | RCL_fallback: 9230 | Mut_infeas: 5431 | Feasible_rate: 93.41% | Best: 103162.46
+Gen  1450 | SCX_fail: 3905 | RCL_fallback: 9538 | Mut_infeas: 5633 | Feasible_rate: 93.42% | Best: 103157.85
+Gen  1500 | SCX_fail: 4019 | RCL_fallback: 9858 | Mut_infeas: 5839 | Feasible_rate: 93.43% | Best: 103139.77
+Gen  1550 | SCX_fail: 4146 | RCL_fallback: 10190 | Mut_infeas: 6044 | Feasible_rate: 93.43% | Best: 103139.77
+Gen  1600 | SCX_fail: 4258 | RCL_fallback: 10527 | Mut_infeas: 6269 | Feasible_rate: 93.42% | Best: 103139.77
+Gen  1650 | SCX_fail: 4362 | RCL_fallback: 10834 | Mut_infeas: 6472 | Feasible_rate: 93.43% | Best: 103139.77
+Gen  1700 | SCX_fail: 4462 | RCL_fallback: 11128 | Mut_infeas: 6666 | Feasible_rate: 93.45% | Best: 103139.77
+Gen  1750 | SCX_fail: 4579 | RCL_fallback: 11450 | Mut_infeas: 6871 | Feasible_rate: 93.46% | Best: 103139.77
+Gen  1800 | SCX_fail: 4670 | RCL_fallback: 11738 | Mut_infeas: 7068 | Feasible_rate: 93.48% | Best: 103116.06
+Gen  1850 | SCX_fail: 4744 | RCL_fallback: 12004 | Mut_infeas: 7260 | Feasible_rate: 93.51% | Best: 103116.06
+Gen  1900 | SCX_fail: 4825 | RCL_fallback: 12267 | Mut_infeas: 7442 | Feasible_rate: 93.54% | Best: 103116.06
+Gen  1950 | SCX_fail: 4910 | RCL_fallback: 12548 | Mut_infeas: 7638 | Feasible_rate: 93.57% | Best: 103116.06
+Gen  2000 | SCX_fail: 5045 | RCL_fallback: 12883 | Mut_infeas: 7838 | Feasible_rate: 93.56% | Best: 103116.06
+Gen  2050 | SCX_fail: 5194 | RCL_fallback: 13210 | Mut_infeas: 8016 | Feasible_rate: 93.56% | Best: 103116.06
+Gen  2100 | SCX_fail: 5382 | RCL_fallback: 13585 | Mut_infeas: 8203 | Feasible_rate: 93.53% | Best: 103116.06
+Gen  2150 | SCX_fail: 5532 | RCL_fallback: 13932 | Mut_infeas: 8400 | Feasible_rate: 93.52% | Best: 103116.06
+Gen  2200 | SCX_fail: 5637 | RCL_fallback: 14239 | Mut_infeas: 8602 | Feasible_rate: 93.53% | Best: 103116.06
+Gen  2250 | SCX_fail: 5771 | RCL_fallback: 14552 | Mut_infeas: 8781 | Feasible_rate: 93.53% | Best: 103116.06
+Gen  2300 | SCX_fail: 5864 | RCL_fallback: 14816 | Mut_infeas: 8952 | Feasible_rate: 93.56% | Best: 103116.06
+Gen  2350 | SCX_fail: 5949 | RCL_fallback: 15080 | Mut_infeas: 9131 | Feasible_rate: 93.58% | Best: 103116.06
+Gen  2400 | SCX_fail: 6003 | RCL_fallback: 15322 | Mut_infeas: 9319 | Feasible_rate: 93.62% | Best: 103038.51
+Gen  2450 | SCX_fail: 6056 | RCL_fallback: 15578 | Mut_infeas: 9522 | Feasible_rate: 93.64% | Best: 103038.51
+Gen  2500 | SCX_fail: 6110 | RCL_fallback: 15812 | Mut_infeas: 9702 | Feasible_rate: 93.68% | Best: 103038.51
+Gen  2550 | SCX_fail: 6189 | RCL_fallback: 16092 | Mut_infeas: 9903 | Feasible_rate: 93.69% | Best: 103038.51
+Gen  2600 | SCX_fail: 6250 | RCL_fallback: 16369 | Mut_infeas: 10119 | Feasible_rate: 93.70% | Best: 102996.96
+Gen  2650 | SCX_fail: 6327 | RCL_fallback: 16650 | Mut_infeas: 10323 | Feasible_rate: 93.72% | Best: 102996.96
+Gen  2700 | SCX_fail: 6459 | RCL_fallback: 16976 | Mut_infeas: 10517 | Feasible_rate: 93.71% | Best: 102996.96
+Gen  2750 | SCX_fail: 6548 | RCL_fallback: 17238 | Mut_infeas: 10690 | Feasible_rate: 93.73% | Best: 102996.96
+Gen  2800 | SCX_fail: 6640 | RCL_fallback: 17536 | Mut_infeas: 10896 | Feasible_rate: 93.74% | Best: 102996.96
+Gen  2850 | SCX_fail: 6692 | RCL_fallback: 17780 | Mut_infeas: 11088 | Feasible_rate: 93.76% | Best: 102996.96
+Gen  2900 | SCX_fail: 6728 | RCL_fallback: 18023 | Mut_infeas: 11295 | Feasible_rate: 93.79% | Best: 102996.96
+Gen  2950 | SCX_fail: 6764 | RCL_fallback: 18240 | Mut_infeas: 11476 | Feasible_rate: 93.82% | Best: 102996.96
+Gen  3000 | SCX_fail: 6802 | RCL_fallback: 18460 | Mut_infeas: 11658 | Feasible_rate: 93.85% | Best: 102996.96
+Gen  3050 | SCX_fail: 6904 | RCL_fallback: 18755 | Mut_infeas: 11851 | Feasible_rate: 93.85% | Best: 102996.96
+Gen  3100 | SCX_fail: 6972 | RCL_fallback: 19025 | Mut_infeas: 12053 | Feasible_rate: 93.86% | Best: 102996.96
+Gen  3150 | SCX_fail: 7146 | RCL_fallback: 19408 | Mut_infeas: 12262 | Feasible_rate: 93.84% | Best: 102996.96
+Gen  3200 | SCX_fail: 7346 | RCL_fallback: 19791 | Mut_infeas: 12445 | Feasible_rate: 93.82% | Best: 102996.96
+Gen  3250 | SCX_fail: 7577 | RCL_fallback: 20223 | Mut_infeas: 12646 | Feasible_rate: 93.78% | Best: 102996.96
+Gen  3300 | SCX_fail: 7766 | RCL_fallback: 20627 | Mut_infeas: 12861 | Feasible_rate: 93.75% | Best: 102996.96
+Gen  3350 | SCX_fail: 7924 | RCL_fallback: 20983 | Mut_infeas: 13059 | Feasible_rate: 93.74% | Best: 102996.96
+Gen  3400 | SCX_fail: 8040 | RCL_fallback: 21304 | Mut_infeas: 13264 | Feasible_rate: 93.73% | Best: 102996.96
+Gen  3450 | SCX_fail: 8327 | RCL_fallback: 21766 | Mut_infeas: 13439 | Feasible_rate: 93.69% | Best: 102996.96
+Gen  3500 | SCX_fail: 8628 | RCL_fallback: 22260 | Mut_infeas: 13632 | Feasible_rate: 93.64% | Best: 102996.96
+Gen  3550 | SCX_fail: 8847 | RCL_fallback: 22674 | Mut_infeas: 13827 | Feasible_rate: 93.61% | Best: 102996.96
+Gen  3600 | SCX_fail: 9080 | RCL_fallback: 23104 | Mut_infeas: 14024 | Feasible_rate: 93.58% | Best: 102996.96
+Gen  3650 | SCX_fail: 9188 | RCL_fallback: 23401 | Mut_infeas: 14213 | Feasible_rate: 93.59% | Best: 102996.96
+Gen  3700 | SCX_fail: 9302 | RCL_fallback: 23695 | Mut_infeas: 14393 | Feasible_rate: 93.60% | Best: 102996.96
+Gen  3750 | SCX_fail: 9366 | RCL_fallback: 23964 | Mut_infeas: 14598 | Feasible_rate: 93.61% | Best: 102996.96
+Gen  3800 | SCX_fail: 9442 | RCL_fallback: 24262 | Mut_infeas: 14820 | Feasible_rate: 93.62% | Best: 102996.96
+Gen  3850 | SCX_fail: 9504 | RCL_fallback: 24527 | Mut_infeas: 15023 | Feasible_rate: 93.63% | Best: 102996.96
+Gen  3900 | SCX_fail: 9598 | RCL_fallback: 24798 | Mut_infeas: 15200 | Feasible_rate: 93.64% | Best: 102977.43
+Gen  3950 | SCX_fail: 9660 | RCL_fallback: 25060 | Mut_infeas: 15400 | Feasible_rate: 93.66% | Best: 102935.87
+Gen  4000 | SCX_fail: 9726 | RCL_fallback: 25318 | Mut_infeas: 15592 | Feasible_rate: 93.67% | Best: 102935.87
+Gen  4050 | SCX_fail: 9802 | RCL_fallback: 25598 | Mut_infeas: 15796 | Feasible_rate: 93.68% | Best: 102935.87
+Gen  4100 | SCX_fail: 9867 | RCL_fallback: 25860 | Mut_infeas: 15993 | Feasible_rate: 93.69% | Best: 102935.87
+Gen  4150 | SCX_fail: 9944 | RCL_fallback: 26112 | Mut_infeas: 16168 | Feasible_rate: 93.71% | Best: 102935.87
+Gen  4200 | SCX_fail: 9995 | RCL_fallback: 26369 | Mut_infeas: 16374 | Feasible_rate: 93.72% | Best: 102935.87
+Gen  4250 | SCX_fail: 10052 | RCL_fallback: 26604 | Mut_infeas: 16552 | Feasible_rate: 93.74% | Best: 102928.28
+Gen  4300 | SCX_fail: 10124 | RCL_fallback: 26896 | Mut_infeas: 16772 | Feasible_rate: 93.75% | Best: 102928.28
+Gen  4350 | SCX_fail: 10192 | RCL_fallback: 27158 | Mut_infeas: 16966 | Feasible_rate: 93.76% | Best: 102928.28
+Gen  4400 | SCX_fail: 10233 | RCL_fallback: 27380 | Mut_infeas: 17147 | Feasible_rate: 93.78% | Best: 102928.28
+Gen  4450 | SCX_fail: 10281 | RCL_fallback: 27624 | Mut_infeas: 17343 | Feasible_rate: 93.79% | Best: 102928.28
+Gen  4500 | SCX_fail: 10366 | RCL_fallback: 27900 | Mut_infeas: 17534 | Feasible_rate: 93.80% | Best: 102928.28
+Gen  4550 | SCX_fail: 10453 | RCL_fallback: 28176 | Mut_infeas: 17723 | Feasible_rate: 93.81% | Best: 102928.28
+Gen  4600 | SCX_fail: 10505 | RCL_fallback: 28416 | Mut_infeas: 17911 | Feasible_rate: 93.82% | Best: 102928.28
+Gen  4650 | SCX_fail: 10521 | RCL_fallback: 28650 | Mut_infeas: 18129 | Feasible_rate: 93.84% | Best: 102928.28
+Gen  4700 | SCX_fail: 10551 | RCL_fallback: 28866 | Mut_infeas: 18315 | Feasible_rate: 93.86% | Best: 102807.14
+
+================================================================================
+Final Statistics:
+Total SCX failures: 10563
+Total RCL fallbacks: 29067
+Total mutation infeasible: 18504
+Total offspring generated: 474400
+Overall feasible offspring rate: 93.87%
+Best fitness achieved: 102807.14

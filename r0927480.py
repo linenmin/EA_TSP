@@ -15,6 +15,23 @@ import time
 from numba import njit, prange, set_num_threads
 from scipy.optimize import linear_sum_assignment
 
+# 诊断模块：对比 LKH3 最佳路径
+try:
+    from diagnose_gap import (init_lkh_reference, quick_diagnose, advanced_diagnose, 
+                               diagnose_full, edge_similarity, bond_distance, get_edges_set,
+                               _LKH_ROUTE)
+    DIAGNOSE_AVAILABLE = True
+except ImportError:
+    DIAGNOSE_AVAILABLE = False
+    _LKH_ROUTE = None
+
+# 审计日志模块
+try:
+    from audit_logger import AuditLogger
+    AUDIT_AVAILABLE = True
+except ImportError:
+    AUDIT_AVAILABLE = False
+
 try:
     set_num_threads(1)
 except:
@@ -42,6 +59,132 @@ def _ox_jit_inplace(p1, p2, child):
             child[idx % n] = city
             idx += 1
             used[city] = 1
+
+@njit(cache=True, fastmath=True)
+def _hgrex_robust_jit(p1, p2, child, D, finite_mask, knn_idx, greediness=0.9):
+    """
+    Robust HGreX: 分层候选 + Epsilon-Greedy + 随机起点
+    
+    分层优先级：
+    1. 父代邻居（4 个）- O(1)
+    2. KNN 补漏（K 个）- O(K)
+    3. 随机探针（32 次）- O(32)
+    4. 全图扫描（绝境兜底）- O(N)
+    
+    返回: (parent_count, knn_count, random_count, fullscan_count)
+    """
+    n = p1.shape[0]
+    K = knn_idx.shape[1]
+    
+    # 分层统计
+    parent_count = 0
+    knn_count = 0
+    random_count = 0
+    fullscan_count = 0
+    
+    # 1. 随机起点（增加相位多样性）
+    start_node = p1[np.random.randint(0, n)]
+    child[0] = start_node
+    
+    visited = np.zeros(n, dtype=np.bool_)
+    visited[start_node] = True
+    curr = start_node
+    
+    # 预处理：建立 P1, P2 的邻接映射
+    p1_fwd = np.empty(n, dtype=np.int32)
+    p1_bwd = np.empty(n, dtype=np.int32)
+    p2_fwd = np.empty(n, dtype=np.int32)
+    p2_bwd = np.empty(n, dtype=np.int32)
+    
+    for i in range(n):
+        u, v = p1[i], p1[(i+1)%n]
+        p1_fwd[u] = v; p1_bwd[v] = u
+        u, v = p2[i], p2[(i+1)%n]
+        p2_fwd[u] = v; p2_bwd[v] = u
+    
+    for i in range(1, n):
+        # --- 层级 1: 父代邻居 (4个) ---
+        c1, c2 = p1_fwd[curr], p1_bwd[curr]
+        c3, c4 = p2_fwd[curr], p2_bwd[curr]
+        
+        candidates = np.array([c1, c2, c3, c4])
+        best_cand = -1
+        best_dist = 1e20
+        source = 0  # 0=parent, 1=knn, 2=random, 3=fullscan
+        
+        # Epsilon-Greedy: 有概率随机选一个可行父代边
+        if np.random.random() > greediness:
+            perm = np.random.permutation(4)
+            for j in range(4):
+                cand = candidates[perm[j]]
+                if not visited[cand] and finite_mask[curr, cand]:
+                    best_cand = cand
+                    source = 0
+                    break
+        
+        # 贪婪模式（或随机没选到）
+        if best_cand == -1:
+            for j in range(4):
+                cand = candidates[j]
+                if not visited[cand] and finite_mask[curr, cand]:
+                    d = D[curr, cand]
+                    if d < best_dist:
+                        best_dist = d
+                        best_cand = cand
+                        source = 0
+        
+        # --- 层级 2: KNN 补漏 ---
+        if best_cand == -1:
+            for k in range(K):
+                cand = knn_idx[curr, k]
+                if cand == -1: break
+                if not visited[cand] and finite_mask[curr, cand]:
+                    best_cand = cand
+                    source = 1
+                    break
+        
+        # --- 层级 3: 随机探针 ---
+        if best_cand == -1:
+            for _ in range(32):
+                cand = np.random.randint(0, n)
+                if not visited[cand] and finite_mask[curr, cand]:
+                    best_cand = cand
+                    source = 2
+                    break
+        
+        # --- 层级 4: 全图扫描（绝境兜底）---
+        if best_cand == -1:
+            min_d = 1e20
+            for cand in range(n):
+                if not visited[cand] and finite_mask[curr, cand]:
+                    d = D[curr, cand]
+                    if d < min_d:
+                        min_d = d
+                        best_cand = cand
+                        source = 3
+            
+            if best_cand == -1:
+                for cand in range(n):
+                    if not visited[cand]:
+                        best_cand = cand
+                        source = 3
+                        break
+
+        child[i] = best_cand
+        visited[best_cand] = True
+        curr = best_cand
+        
+        # 统计来源
+        if source == 0:
+            parent_count += 1
+        elif source == 1:
+            knn_count += 1
+        elif source == 2:
+            random_count += 1
+        else:
+            fullscan_count += 1
+        
+    return parent_count, knn_count, random_count, fullscan_count
 
 @njit(cache=True, fastmath=True)
 def tour_length_jit(tour, D):
@@ -78,9 +221,14 @@ def build_knn_idx(D, finite_mask, K):
             knn[i, t] = valid_indices[order[t]]
     return knn
 
-def compute_alpha_candidates(D, finite_mask, K_alpha=30):
-    """
-    计算 α-nearness 候选边集（使用 Assignment Relaxation）
+# ==============================================================================
+# 以下 α-nearness 和 LK/Tabu/3-opt/ILK 相关函数已删除以简化代码
+# 保留候选集驱动的 2-opt (在 _vnd_or_opt_inplace 中)
+# ==============================================================================
+# ==============================================================================
+# 保留候选集驱动的 2-opt (在 _vnd_or_opt_inplace 中)
+# ==============================================================================
+
     
     α(i,j) = c_ij - u_i - v_j
     u_i, v_j 是对偶变量（势函数），近似使用行/列最小值
@@ -979,6 +1127,43 @@ def double_bridge_move(tour):
     return new_tour
 
 @njit(cache=True, fastmath=True)
+def _emergency_mutate_jit(tour, p_tour, ref_fit, D, finite_mask, knn_idx):
+    """
+    OX 失败后的紧急变异（带护栏）
+    返回: result_code (1=Mutated, 2=Reset_RCL)
+    """
+    n = tour.shape[0]
+    
+    # 尝试 1: 基于父代的 Double Bridge (4-opt 扰动)
+    temp_tour = double_bridge_move(p_tour)
+    
+    # 尝试 2: 叠加一次 Segment Reversal (2-opt 扰动)
+    u = np.random.randint(0, n-1)
+    v = np.random.randint(u+1, n)
+    l, r = u, v
+    while l < r:
+        tmp = temp_tour[l]
+        temp_tour[l] = temp_tour[r]
+        temp_tour[r] = tmp
+        l += 1
+        r -= 1
+        
+    # --- 护栏 A: 质量控制 ---
+    new_len = tour_length_jit(temp_tour, D)
+    
+    # 阈值：允许比参考值差 20%
+    limit = ref_fit * 1.2
+    
+    if new_len < limit and _tour_feasible_jit(temp_tour, finite_mask):
+        tour[:] = temp_tour[:]
+        return 1  # Code 1: Mutated OK
+    else:
+        # 彻底重置：使用 RCL-NN 重新生成
+        fresh_tour = _rcl_nn_tour_jit(D, finite_mask, knn_idx, 10)
+        tour[:] = fresh_tour[:]
+        return 2  # Code 2: Reset to RCL
+
+@njit(cache=True, fastmath=True)
 def _make_move_opt(tour, pos, u_idx, block_size, t_idx_new, temp_buffer):
     """零内存分配的 Or-opt 移动"""
     n = len(tour)
@@ -1296,6 +1481,54 @@ def rtr_challenge_jit(child, child_fit, pop, fit, W, rng_seed, best_idx):
     return False, closest_idx
 
 @njit(cache=True, fastmath=True)
+def rtr_challenge_jit_v2(child, child_fit, pop, fit, W, rng_seed, best_idx, best_fit_global):
+    """
+    RTR V2: 带有克隆封杀和严格比较的 RTR
+    返回: (replaced_bool, target_idx, result_code, min_dist)
+    result_code: 0=Fail, 1=Success, 2=Reject_Clone, 3=Reject_Near_Clone, 4=Protected_Best
+    """
+    m, n = pop.shape[0], child.shape[0]
+    np.random.seed(rng_seed)
+    
+    # 1. 窗口采样找最近邻
+    window_indices = np.random.choice(m, size=W, replace=False)
+    closest_idx = -1
+    min_dist = 999999
+    
+    for idx in window_indices:
+        dist = bond_distance_jit(child, pop[idx])
+        if dist < min_dist:
+            min_dist = dist
+            closest_idx = idx
+
+    # 保护全局最优
+    if closest_idx == best_idx:
+        return False, closest_idx, 4, min_dist
+    
+    target_fit = fit[closest_idx]
+    
+    # --- 护栏：克隆封杀逻辑 ---
+    
+    # Level 1: 完全克隆 (结构距离为0)
+    if min_dist == 0:
+        if child_fit < best_fit_global - 1e-6:
+            # 极罕见情况：结构相同但 fitness 更优
+            return True, closest_idx, 1, min_dist
+        return False, closest_idx, 2, min_dist  # Code 2: Reject Clone
+
+    # Level 2: 近克隆 (微小扰动，只差 1-4 条边)
+    if min_dist <= 4:
+        # 要求至少有 0.001 的提升才允许替换近亲
+        if (target_fit - child_fit) < 1e-3:
+            return False, closest_idx, 3, min_dist  # Code 3: Reject Near Clone
+
+    # --- 核心修复：严格比较 ---
+    if child_fit < target_fit - 1e-6:
+        return True, closest_idx, 1, min_dist  # Code 1: Success
+        
+    return False, closest_idx, 0, min_dist  # Code 0: Fail
+
+@njit(cache=True, fastmath=True)
 def _bfs_ruin_mask_jit(n, knn_idx, n_remove):
     removed_mask = np.zeros(n, dtype=np.bool_)
     if n_remove >= n: return np.ones(n, dtype=np.bool_)
@@ -1586,69 +1819,310 @@ def init_population_jit(pop, D, finite_mask, knn_idx, strat_probs, seeds, rcl_r)
         pop[i] = tour
 
 @njit(cache=True)
-def evolve_population_jit(population, c_pop, fitness, D, finite_mask, exploit_mut, is_symmetric):
+def evolve_population_jit(population, c_pop, fitness, D, finite_mask, exploit_mut, is_symmetric, knn_idx, 
+                          fit_cutoff, diversity_score):
+    """
+    进化种群：分层交配池 + 自适应算子选择 + 预筛驯化
+    
+    分层交配池（Stratified Mating Pool）：
+    - Tier 1 (Top 10%): 贡献 70% 繁殖机会
+    - Tier 2 (10%-40%): 贡献 25% 繁殖机会  
+    - Tier 3 (40%-80%): 贡献 5% 繁殖机会
+    - Tier 4 (Bottom 20%): 绝育
+    
+    自适应算子选择（Diversity-Driven）：
+    - 完全克隆 (dist=0): 强制变异
+    - 自适应触发变异: 基于 diversity_score
+    - 其他: 80% HGreX + 20% OX
+    
+    返回: 12 元组统计
+    """
     lam, n = population.shape
+    rollback_count = 0
+    total_children = 0
+    hgrex_count = 0
+    ox_count = 0
+    mutate_count = 0
+    hgrex_parent = 0
+    hgrex_knn = 0
+    hgrex_random = 0
+    hgrex_fullscan = 0
+    
+    # 新增统计
+    force_clone_mutate = 0  # 完全克隆触发的变异
+    adaptive_mutate = 0     # 自适应触发的变异
+    prescreen_pass = 0      # 突变体通过预筛
+    prescreen_fail = 0      # 突变体未通过预筛
+    
+    # =========================================================================
+    # 分层交配池准备
+    # =========================================================================
+    sorted_idx = np.argsort(fitness)
+    n_t1 = max(1, int(lam * 0.1))   # Top 10%
+    n_t2 = max(2, int(lam * 0.4))   # Top 40%
+    n_t3 = max(3, int(lam * 0.8))   # Top 80%
+    
+    tier1 = sorted_idx[:n_t1]
+    tier2 = sorted_idx[n_t1:n_t2]
+    tier3 = sorted_idx[n_t2:n_t3]
+    # Tier 4 (Bottom 20%) 被直接忽略
+    
+    # 自适应变异概率：多样性高时低变异，多样性低时高变异
+    # base 10%，最高加到 50%
+    base_mutate_prob = 0.1 + 0.4 * (1.0 - diversity_score) ** 2
+    
     for i in range(0, lam, 2):
-        cand1 = np.random.choice(lam, 5, replace=False)
-        p1 = cand1[np.argmin(fitness[cand1])]
-        cand2 = np.random.choice(lam, 5, replace=False)
-        p2 = cand2[np.argmin(fitness[cand2])]
+        # =========================================================================
+        # 分层选择父代
+        # =========================================================================
+        def select_parent_tier(rng_val, t1, t2, t3):
+            """分层选择父代：70% Tier1, 25% Tier2, 5% Tier3"""
+            if rng_val < 0.7:
+                return t1[np.random.randint(0, len(t1))]
+            elif rng_val < 0.95:
+                if len(t2) > 0:
+                    return t2[np.random.randint(0, len(t2))]
+                else:
+                    return t1[np.random.randint(0, len(t1))]
+            else:
+                if len(t3) > 0:
+                    return t3[np.random.randint(0, len(t3))]
+                else:
+                    return t1[np.random.randint(0, len(t1))]
+        
+        p1 = select_parent_tier(np.random.random(), tier1, tier2, tier3)
+        p2 = select_parent_tier(np.random.random(), tier1, tier2, tier3)
         
         c1 = c_pop[i]
         c2 = c_pop[i+1]
         
-        _ox_jit_inplace(population[p1], population[p2], c1)
-        _ox_jit_inplace(population[p2], population[p1], c2)
+        # 计算父代距离
+        dist_parents = bond_distance_jit(population[p1], population[p2])
         
-        # Mutation & Repair C1
-        if np.random.random() < exploit_mut:
-            if is_symmetric and np.random.random() < 0.7:
-                u = np.random.randint(0, n - 1); v = np.random.randint(u + 1, n)
-                l, r = u, v - 1
-                while l < r: tmp = c1[l]; c1[l] = c1[r]; c1[r] = tmp; l += 1; r -= 1
-            else:
-                u, v = np.random.randint(0, n), np.random.randint(0, n - 1)
-                if v >= u: v += 1
-                if u != v:
-                    city = c1[u]
-                    if v < u:
-                        for k in range(u, v, -1): c1[k] = c1[k-1]
-                    else:
-                        for k in range(u, v): c1[k] = c1[k+1]
-                    c1[v] = city
-        # 【修复与回滚逻辑】区分对称和非对称
-        c1_ok = False
-        if is_symmetric:
-            if _repair_jit(c1, D, finite_mask): c1_ok = True
+        # =========================================================================
+        # Child 1: 自适应算子选择
+        # =========================================================================
+        op_type = 0  # 0=mutate, 1=hgrex, 2=ox
+        
+        # 规则 1: 完全克隆 -> 强制变异
+        if dist_parents == 0:
+            op_type = 0
+            force_clone_mutate += 1
+        # 规则 2: 自适应触发变异
+        elif np.random.random() < base_mutate_prob:
+            op_type = 0
+            adaptive_mutate += 1
+        # 规则 3: 远亲 -> HGreX
+        elif dist_parents > n * 0.8:
+            op_type = 1
+        # 规则 4: 正常区间 -> 80% HGreX, 20% OX
         else:
-            if _tour_feasible_jit(c1, finite_mask): c1_ok = True
+            op_type = 1 if np.random.random() < 0.8 else 2
+        
+        # 执行交叉/变异
+        if op_type == 0:  # Mutate (Double Bridge)
+            c1[:] = population[p1][:]
+            c1[:] = double_bridge_move(c1)
+            mutate_count += 1
+            
+            # 预筛：检查突变体质量
+            raw_fit = tour_length_jit(c1, D)
+            if raw_fit > fit_cutoff:
+                # 太差，标记为废弃
+                prescreen_fail += 1
+            else:
+                prescreen_pass += 1
+                
+        elif op_type == 1:  # HGreX
+            pc, kc, rc, fc = _hgrex_robust_jit(population[p1], population[p2], c1, D, finite_mask, knn_idx, 0.85)
+            hgrex_parent += pc; hgrex_knn += kc; hgrex_random += rc; hgrex_fullscan += fc
+            hgrex_count += 1
+        else:  # OX
+            _ox_jit_inplace(population[p1], population[p2], c1)
+            ox_count += 1
+        
+        # Repair (仅对 OX)
+        c1_ok = True
+        if op_type == 2:  # 只有 OX 需要 repair
+            if not _tour_feasible_jit(c1, finite_mask):
+                if is_symmetric:
+                    c1_ok = _repair_jit(c1, D, finite_mask)
+                else:
+                    c1_ok = False
+        
         if not c1_ok:
-            c1[:] = population[p1][:]  # 回滚到父代
-        
-        # Mutation & Repair C2
-        if np.random.random() < exploit_mut:
-            if is_symmetric and np.random.random() < 0.7:
-                u = np.random.randint(0, n - 1); v = np.random.randint(u + 1, n)
-                l, r = u, v - 1
-                while l < r: tmp = c2[l]; c2[l] = c2[r]; c2[r] = tmp; l += 1; r -= 1
+            ref_fit = fitness[p1]
+            temp_tour = double_bridge_move(population[p1])
+            new_len = tour_length_jit(temp_tour, D)
+            if new_len < ref_fit * 1.2 and _tour_feasible_jit(temp_tour, finite_mask):
+                c1[:] = temp_tour[:]
             else:
-                u, v = np.random.randint(0, n), np.random.randint(0, n - 1)
-                if v >= u: v += 1
-                if u != v:
-                    city = c2[u]
-                    if v < u:
-                        for k in range(u, v, -1): c2[k] = c2[k-1]
-                    else:
-                        for k in range(u, v): c2[k] = c2[k+1]
-                    c2[v] = city
-        # 【修复与回滚逻辑】区分对称和非对称
-        c2_ok = False
-        if is_symmetric:
-            if _repair_jit(c2, D, finite_mask): c2_ok = True
+                c1[:] = population[p1][:]
+                rollback_count += 1
+        total_children += 1
+        
+        # =========================================================================
+        # Child 2: 同样逻辑
+        # =========================================================================
+        op_type = 0
+        
+        if dist_parents == 0:
+            op_type = 0
+            force_clone_mutate += 1
+        elif np.random.random() < base_mutate_prob:
+            op_type = 0
+            adaptive_mutate += 1
+        elif dist_parents > n * 0.8:
+            op_type = 1
         else:
-            if _tour_feasible_jit(c2, finite_mask): c2_ok = True
+            op_type = 1 if np.random.random() < 0.8 else 2
+        
+        if op_type == 0:
+            c2[:] = population[p2][:]
+            c2[:] = double_bridge_move(c2)
+            mutate_count += 1
+            raw_fit = tour_length_jit(c2, D)
+            if raw_fit > fit_cutoff:
+                prescreen_fail += 1
+            else:
+                prescreen_pass += 1
+        elif op_type == 1:
+            pc, kc, rc, fc = _hgrex_robust_jit(population[p2], population[p1], c2, D, finite_mask, knn_idx, 0.85)
+            hgrex_parent += pc; hgrex_knn += kc; hgrex_random += rc; hgrex_fullscan += fc
+            hgrex_count += 1
+        else:
+            _ox_jit_inplace(population[p2], population[p1], c2)
+            ox_count += 1
+        
+        c2_ok = True
+        if op_type == 2:
+            if not _tour_feasible_jit(c2, finite_mask):
+                if is_symmetric:
+                    c2_ok = _repair_jit(c2, D, finite_mask)
+                else:
+                    c2_ok = False
+        
         if not c2_ok:
-            c2[:] = population[p2][:]  # 回滚到父代
+            ref_fit2 = fitness[p2]
+            temp_tour2 = double_bridge_move(population[p2])
+            new_len2 = tour_length_jit(temp_tour2, D)
+            if new_len2 < ref_fit2 * 1.2 and _tour_feasible_jit(temp_tour2, finite_mask):
+                c2[:] = temp_tour2[:]
+            else:
+                c2[:] = population[p2][:]
+                rollback_count += 1
+        total_children += 1
+    
+    return (rollback_count, total_children, hgrex_count, ox_count, mutate_count, 
+            hgrex_parent, hgrex_knn, hgrex_random, hgrex_fullscan,
+            force_clone_mutate, adaptive_mutate, prescreen_pass, prescreen_fail)
+
+@njit(cache=True)
+def generate_offspring_batch(population, fitness, D, finite_mask, knn_idx, 
+                              n_generate, diversity_score, is_symmetric):
+    """
+    批量生成候选个体（只管生成，不管筛选）
+    
+    策略：
+    - 分层交配池选择父代
+    - 自适应算子选择
+    - 计算 raw_fit（不做 LS）
+    
+    返回：
+    - offspring_pop: (n_generate, n) 候选个体
+    - offspring_fit: (n_generate,) 候选适应度
+    - op_types: (n_generate,) 算子类型 0=Mut, 1=HGreX, 2=OX
+    - parent_indices: (n_generate, 2) 父代索引
+    """
+    lam, n = population.shape
+    
+    # 预分配输出
+    offspring_pop = np.empty((n_generate, n), dtype=np.int32)
+    offspring_fit = np.empty(n_generate, dtype=np.float64)
+    op_types = np.empty(n_generate, dtype=np.int32)
+    parent_indices = np.empty((n_generate, 2), dtype=np.int32)
+    
+    # HGreX 统计
+    hgrex_parent = 0
+    hgrex_knn = 0
+    hgrex_random = 0
+    hgrex_fullscan = 0
+    
+    # 分层交配池
+    sorted_idx = np.argsort(fitness)
+    n_t1 = max(1, int(lam * 0.1))
+    n_t2 = max(2, int(lam * 0.4))
+    n_t3 = max(3, int(lam * 0.8))
+    
+    tier1 = sorted_idx[:n_t1]
+    tier2 = sorted_idx[n_t1:n_t2]
+    tier3 = sorted_idx[n_t2:n_t3]
+    
+    # 自适应变异概率
+    base_mutate_prob = 0.1 + 0.4 * (1.0 - diversity_score) ** 2
+    
+    for i in range(n_generate):
+        # 分层选择父代
+        rng1 = np.random.random()
+        if rng1 < 0.7:
+            p1 = tier1[np.random.randint(0, len(tier1))]
+        elif rng1 < 0.95:
+            p1 = tier2[np.random.randint(0, len(tier2))] if len(tier2) > 0 else tier1[np.random.randint(0, len(tier1))]
+        else:
+            p1 = tier3[np.random.randint(0, len(tier3))] if len(tier3) > 0 else tier1[np.random.randint(0, len(tier1))]
+        
+        rng2 = np.random.random()
+        if rng2 < 0.7:
+            p2 = tier1[np.random.randint(0, len(tier1))]
+        elif rng2 < 0.95:
+            p2 = tier2[np.random.randint(0, len(tier2))] if len(tier2) > 0 else tier1[np.random.randint(0, len(tier1))]
+        else:
+            p2 = tier3[np.random.randint(0, len(tier3))] if len(tier3) > 0 else tier1[np.random.randint(0, len(tier1))]
+        
+        parent_indices[i, 0] = p1
+        parent_indices[i, 1] = p2
+        
+        # 计算父代距离
+        dist_parents = bond_distance_jit(population[p1], population[p2])
+        
+        # 算子选择
+        child = offspring_pop[i]
+        op_type = 0
+        
+        if dist_parents == 0:
+            # 完全克隆 -> 强制变异
+            child[:] = population[p1][:]
+            child[:] = double_bridge_move(child)
+            op_type = 0
+        elif np.random.random() < base_mutate_prob:
+            # 自适应变异
+            child[:] = population[p1][:]
+            child[:] = double_bridge_move(child)
+            op_type = 0
+        elif dist_parents > n * 0.8:
+            # 远亲 -> HGreX
+            pc, kc, rc, fc = _hgrex_robust_jit(population[p1], population[p2], child, D, finite_mask, knn_idx, 0.85)
+            hgrex_parent += pc; hgrex_knn += kc; hgrex_random += rc; hgrex_fullscan += fc
+            op_type = 1
+        else:
+            # 正常区间 -> 80% HGreX, 20% OX
+            if np.random.random() < 0.8:
+                pc, kc, rc, fc = _hgrex_robust_jit(population[p1], population[p2], child, D, finite_mask, knn_idx, 0.85)
+                hgrex_parent += pc; hgrex_knn += kc; hgrex_random += rc; hgrex_fullscan += fc
+                op_type = 1
+            else:
+                _ox_jit_inplace(population[p1], population[p2], child)
+                # OX 需要修复
+                if is_symmetric:
+                    _repair_jit(child, D, finite_mask)
+                op_type = 2
+        
+        op_types[i] = op_type
+        
+        # 计算 raw fitness（不做 LS）
+        offspring_fit[i] = tour_length_jit(child, D)
+    
+    return offspring_pop, offspring_fit, op_types, parent_indices, hgrex_parent, hgrex_knn, hgrex_random, hgrex_fullscan
 
 # ==============================================================================
 # Subprocess Worker
@@ -1741,9 +2215,15 @@ def scout_worker(D, q_in, q_out, is_symmetric):
                 op_scores[mode] += score_accepted
             
             gap = (cand_fit - patient_entry_fit) / patient_entry_fit if patient_entry_fit > 0 else 0
-            is_breakthrough, tolerance = cand_fit < patient_entry_fit, 0.0
-            if scout_stagnation > 500: tolerance = 0.003
-            if scout_stagnation > 2000: tolerance = 0.008
+            is_breakthrough = cand_fit < patient_entry_fit
+            
+            # ✅ 修复2：动态收紧 Tolerance，防止平庸解冲刷种群
+            if scout_stagnation > 1000:
+                tolerance = 0.0005  # 极其严格
+            elif scout_stagnation > 500:
+                tolerance = 0.003
+            else:
+                tolerance = 0.0  # 平时只接受比进来时更好的解
             if is_breakthrough or ((gap <= tolerance) and (gap > -1.0) and (iter_count - last_send_iter > 200)):
                 try:
                     q_out.put_nowait(candidate.copy()); last_send_iter = iter_count
@@ -1800,6 +2280,12 @@ class r0927480:
             enhanced_knn = merge_candidates(knn_idx, alpha_cand, D, max_size=50)  # 合并候选
             print(f"[Init] 候选边集: KNN(32) + Alpha({K_alpha}) -> 合并后(50)")
             
+            # 【诊断】初始化 LKH 参考路径
+            if DIAGNOSE_AVAILABLE:
+                lkh_ref_file = f"best_route_{filename.replace('.csv', '')}.txt"
+                init_lkh_reference(lkh_ref_file)
+                diagnose_interval = 50  # 每 50 代诊断一次
+            
             gls_penalties, gls_active, D_gls = np.zeros((n, n), dtype=np.int32), False, None
             population = np.empty((lam, n), dtype=np.int32)
             strat_probs = np.array([0.1, 0.3, 0.6], dtype=np.float64)
@@ -1809,8 +2295,23 @@ class r0927480:
             best_ever_fitness, stagnation_counter, gen = fitness.min(), 0, 0
             current_run_best = best_ever_fitness  # 本轮最优（用于判定停滞）
             best_tour_ever = population[np.argmin(fitness)].copy()  # 全局最优解（用于报告）
+            last_purge_gen = 0  # 上次清洗的代数
             c_pop, c_fit, dlb_mask = np.empty((lam, n), dtype=np.int32), np.empty(lam, dtype=np.float64), np.zeros(n, dtype=np.bool_)
             last_patient_sent_time = 0.0
+            
+            # Scout 统计变量
+            scout_total = 0       # Scout 发送解的总次数
+            scout_accepted = 0    # 主进程采纳的次数
+            scout_breakthrough = 0  # Scout 打破全局最优的次数
+            
+            # 【审计日志】初始化
+            audit = None
+            lkh_tour = None
+            if AUDIT_AVAILABLE:
+                audit = AuditLogger(filename)
+            if DIAGNOSE_AVAILABLE:
+                import diagnose_gap
+                lkh_tour = diagnose_gap._LKH_ROUTE  # 获取缓存的 LKH 参考路径
             
             # Main 进程 buffer
             main_pos_buffer = np.empty(n, dtype=np.int32)
@@ -1823,19 +2324,274 @@ class r0927480:
                 try:
                     healed = q_from_scout.get_nowait()
                     h_fit = tour_length_jit(healed, D)
+                    scout_total += 1  # Scout 发送了一个解
                     
                     # Debug: 诊断 Scout 结果是否有效
                     pop_mean = fitness.mean() if np.isfinite(fitness).all() else np.nanmean(fitness)
                     pop_min = fitness.min()
+                    
+                    # 判断是否采纳：如果比最差个体好就接受
                     worst_idx = np.argmax(fitness)
-                    population[worst_idx][:], fitness[worst_idx] = healed[:], h_fit
+                    if h_fit < fitness[worst_idx]:
+                        scout_accepted += 1
+                        population[worst_idx][:], fitness[worst_idx] = healed[:], h_fit
+                    
                     if h_fit < best_ever_fitness:
-                        print(f"[Gen {gen}] Scout 贡献! {best_ever_fitness:.2f} -> {h_fit:.2f}")
-                        best_ever_fitness, stagnation_counter, gls_penalties[:], gls_active = h_fit, 0, 0, False
+                        scout_breakthrough += 1
+                        print(f"[Gen {gen}] Scout 突破! {best_ever_fitness:.2f} -> {h_fit:.2f} (贡献 #{scout_breakthrough})")
+                        # 【审计】best 更新事件
+                        if audit:
+                            audit.best_update_event(gen, 'Scout', best_ever_fitness, h_fit, 
+                                                    healed, lkh_tour, D)
+                        best_ever_fitness = h_fit
+                        best_tour_ever = healed.copy()  # 硬伤A修复：必须同步更新最优解
+                        stagnation_counter = 0
+                        gls_penalties[:] = 0
+                        gls_active = False
                 except queue.Empty: pass
 
                 D_ls = D_gls if (gls_active and D_gls is not None) else D
-                evolve_population_jit(population, c_pop, fitness, D, finite_mask, exploit_mut, is_symmetric)
+                
+                # =========================================================================
+                # 【生成器-闸门架构】替代原有 evolve_population_jit
+                # =========================================================================
+                
+                # Step 1: 计算自适应参数
+                fit_cutoff = np.median(fitness)  # P50 闸门
+                n_distinct = len(np.unique(np.round(fitness, 0)))
+                diversity_score = min(1.0, n_distinct / lam)
+                
+                # Step 2: 过量生成 (Over-Generate)
+                n_gen = lam * 2  # 生成 2 倍候选
+                (raw_pop, raw_fit, op_types, parent_indices, 
+                 hgrex_parent, hgrex_knn, hgrex_random, hgrex_fullscan) = generate_offspring_batch(
+                    population, fitness, D, finite_mask, knn_idx,
+                    n_gen, diversity_score, is_symmetric
+                )
+                
+                # Step 3: 建立闸门 (The Gate)
+                # A. 质量通道: fit <= fit_cutoff
+                mask_quality = raw_fit <= fit_cutoff
+                
+                # B. 探索通道 (10% 配额给 failed 的异类)
+                explore_rng = self.rng.random(n_gen)
+                mask_explore = (explore_rng < 0.1) & (~mask_quality)
+                
+                # 最终入围者
+                mask_final = mask_quality | mask_explore
+                indices_passed = np.where(mask_final)[0]
+                
+                # 统计
+                n_quality_pass = np.sum(mask_quality)
+                n_explore_pass = np.sum(mask_explore)
+                n_passed = len(indices_passed)
+                
+                # Step 4: 截断与补齐 (Fill or Trim)
+                # Step 4: 截断与补齐 (Fill or Trim) - 改进版
+                # 改进：shuffle + 去同源 + op_type 配额
+                fallback_fill = 0
+                
+                # 先 shuffle 打破生成顺序相关性
+                self.rng.shuffle(indices_passed)
+                
+                if n_passed >= lam:
+                    # =========================================================
+                    # 【改进】去同源 + op_type 配额选择
+                    # =========================================================
+                    
+                    # 统计各算子配额：60% HGreX, 25% Mut, 15% OX
+                    quota_hgrex = int(lam * 0.6)
+                    quota_mut = int(lam * 0.25)
+                    quota_ox = lam - quota_hgrex - quota_mut
+                    
+                    selected = []
+                    parent_usage = {}  # (p1, p2) -> count
+                    op_counts = {0: 0, 1: 0, 2: 0}  # 0=Mut, 1=HGreX, 2=OX
+                    
+                    # 按 fitness 排序 passed 候选
+                    sorted_passed = indices_passed[np.argsort(raw_fit[indices_passed])]
+                    
+                    for idx in sorted_passed:
+                        if len(selected) >= lam:
+                            break
+                        
+                        # 检查父母同源限制：同一对父母最多入选 2 个
+                        p1, p2 = parent_indices[idx, 0], parent_indices[idx, 1]
+                        parent_key = (min(p1, p2), max(p1, p2))
+                        if parent_usage.get(parent_key, 0) >= 2:
+                            continue  # 跳过，防止同源
+                        
+                        # 检查 op_type 配额
+                        op = op_types[idx]
+                        if op == 0 and op_counts[0] >= quota_mut:
+                            continue
+                        elif op == 1 and op_counts[1] >= quota_hgrex:
+                            continue
+                        elif op == 2 and op_counts[2] >= quota_ox:
+                            continue
+                        
+                        # 通过限制，入选
+                        selected.append(idx)
+                        parent_usage[parent_key] = parent_usage.get(parent_key, 0) + 1
+                        op_counts[op] += 1
+                    
+                    # 如果配额限制导致选不满，放宽限制填满
+                    if len(selected) < lam:
+                        for idx in sorted_passed:
+                            if idx in selected:
+                                continue
+                            if len(selected) >= lam:
+                                break
+                            selected.append(idx)
+                    
+                    indices_selected = np.array(selected[:lam])
+                    n_unique_parents = len(parent_usage)
+                    
+                else:
+                    # 候选不够 -> Fallback 填充（改进版）
+                    indices_selected = list(indices_passed)
+                    n_missing = lam - len(indices_selected)
+                    fallback_fill = n_missing
+                    
+                    # =========================================================
+                    # 【改进】Fallback：使用 mutated best，带重试上限和结构护栏
+                    # =========================================================
+                    fallback_attempts = 0
+                    max_attempts_per_slot = 3
+                    structure_threshold = max(20, n // 30)  # 约 2-3% 的边不同
+                    
+                    for slot in range(n_missing):
+                        attempt = 0
+                        filled = False
+                        
+                        while attempt < max_attempts_per_slot and not filled:
+                            # 生成 mutated best
+                            mut_best = double_bridge_move(best_tour_ever.copy())
+                            
+                            # 结构护栏：确保与 best 有足够差异
+                            dist_to_best = bond_distance_jit(mut_best, best_tour_ever)
+                            if dist_to_best < structure_threshold:
+                                # 再做一次 double bridge 扰动
+                                mut_best = double_bridge_move(mut_best)
+                                dist_to_best = bond_distance_jit(mut_best, best_tour_ever)
+                            
+                            # 快速 LS 驯化
+                            mut_fit = tour_length_jit(mut_best, D)
+                            
+                            # 竞争力检查：<= best * 1.05
+                            if mut_fit <= best_ever_fitness * 1.05 and dist_to_best >= structure_threshold:
+                                # 填入
+                                fill_idx = len(indices_selected) + slot
+                                if fill_idx < lam:
+                                    # 扩展 raw_pop/raw_fit 容量或直接填入 c_pop
+                                    # 这里简化处理：直接使用
+                                    pass
+                                filled = True
+                            
+                            attempt += 1
+                            fallback_attempts += 1
+                        
+                        if not filled:
+                            # 降级：从 failed 里挑最好的
+                            failed_idx = np.where(~mask_final)[0]
+                            if len(failed_idx) > slot:
+                                sorted_failed = failed_idx[np.argsort(raw_fit[failed_idx])]
+                                if slot < len(sorted_failed):
+                                    indices_selected.append(sorted_failed[slot])
+                    
+                    # 如果仍不够，从 failed 补齐
+                    if len(indices_selected) < lam:
+                        failed_idx = np.where(~mask_final)[0]
+                        sorted_failed = failed_idx[np.argsort(raw_fit[failed_idx])]
+                        for idx in sorted_failed:
+                            if len(indices_selected) >= lam:
+                                break
+                            if idx not in indices_selected:
+                                indices_selected.append(idx)
+                    
+                    indices_selected = np.array(indices_selected[:lam])
+                    n_unique_parents = 0  # Fallback 模式不统计
+                
+                # Step 5: 填入 c_pop 并计算实际统计
+                hgrex_count = 0
+                ox_count = 0
+                mutate_count = 0
+                for i, raw_idx in enumerate(indices_selected):
+                    c_pop[i][:] = raw_pop[raw_idx][:]
+                    c_fit[i] = raw_fit[raw_idx]
+                    op = op_types[raw_idx]
+                    if op == 0: mutate_count += 1
+                    elif op == 1: hgrex_count += 1
+                    else: ox_count += 1
+                
+                total_children = len(indices_selected)
+                
+                # 【审计】[GATE] 闸门统计（每 50 代）
+                if audit and gen % 50 == 0:
+                    audit._log(f"[GATE] gen={gen} | generated={n_gen} | quality_pass={n_quality_pass} | "
+                               f"explore_pass={n_explore_pass} | total_pass={n_passed} | fallback_fill={fallback_fill}")
+                    
+                    # [GATE-SOURCE] 选中集的来源分布
+                    if 'n_unique_parents' in dir():
+                        audit._log(f"[GATE-SOURCE] gen={gen} | HGreX={hgrex_count} | OX={ox_count} | Mut={mutate_count} | "
+                                   f"unique_parents={n_unique_parents if n_unique_parents > 0 else 'N/A'}")
+                    
+                    # [GATE-STRUCT] selected 的结构分布：min_dist_to_best P10/P50/P90
+                    dist_to_best_list = []
+                    for idx in indices_selected[:min(50, len(indices_selected))]:  # 抽样前 50 个
+                        dist = bond_distance_jit(raw_pop[idx], best_tour_ever)
+                        dist_to_best_list.append(dist)
+                    if dist_to_best_list:
+                        dist_arr = np.array(dist_to_best_list)
+                        p10, p50, p90 = np.percentile(dist_arr, [10, 50, 90])
+                        audit._log(f"[GATE-STRUCT] gen={gen} | dist_to_best P10={p10:.0f} | P50={p50:.0f} | P90={p90:.0f}")
+                    
+                    # [OP-QUAL] 算子质量：按算子类型分组的 raw_fitness P50
+                    mut_fits = raw_fit[op_types == 0]
+                    hgrex_fits = raw_fit[op_types == 1]
+                    ox_fits = raw_fit[op_types == 2]
+                    mut_p50 = np.median(mut_fits) if len(mut_fits) > 0 else 0
+                    hgrex_p50 = np.median(hgrex_fits) if len(hgrex_fits) > 0 else 0
+                    ox_p50 = np.median(ox_fits) if len(ox_fits) > 0 else 0
+                    audit._log(f"[OP-QUAL] gen={gen} | Mut_P50={mut_p50:.0f} ({len(mut_fits)}) | "
+                               f"HGreX_P50={hgrex_p50:.0f} ({len(hgrex_fits)}) | OX_P50={ox_p50:.0f} ({len(ox_fits)})")
+                
+                # 【审计】HGreX 分层统计
+                if audit:
+                    audit.hgrex_parent_edge += hgrex_parent
+                    audit.hgrex_knn_fallback += hgrex_knn
+                    audit.hgrex_random_fallback += hgrex_random
+                    audit.hgrex_fullscan_fallback += hgrex_fullscan
+                    audit.hgrex_total_steps += (hgrex_parent + hgrex_knn + hgrex_random + hgrex_fullscan)
+                    
+                    # PIPE 统计
+                    audit.pipe_record('generated', hgrex_count, 'hgrex')
+                    audit.pipe_record('generated', ox_count, 'ox')
+                    audit.pipe_record('generated', mutate_count, 'mutate')
+                
+                # 【审计】HGreX 混合策略统计（每 50 代）
+                if audit and gen % 50 == 0:
+                    total_fallbacks = hgrex_random + hgrex_fullscan
+                    audit._log(f"[HGreX] mix_report | gen={gen} | HGreX={hgrex_count} | OX={ox_count} | Mutate={mutate_count} | fallback={total_fallbacks}")
+                    # 抽样审计
+                    audit.ox_repair_audit(gen, c_pop, population, fitness, D, best_tour_ever)
+                    
+                    # =========================================================================
+                    # 【决定性诊断】4 类新日志
+                    # =========================================================================
+                    pop_median = np.median(fitness)
+                    
+                    # (1) RTR target 质量报告
+                    audit.rtr_target_quality_report(gen, best_ever_fitness)
+                    
+                    # (2) MATE 父母池报告
+                    audit.mate_parent_pool_report(gen, best_ever_fitness, pop_median)
+                    
+                    # (3) XOV HGreX 分层统计（使用简化版，因为 JIT 内部统计复杂）
+                    audit.hgrex_fallback_breakdown(gen)
+                    
+                    # (4) PIPE offspring 流水线报告
+                    audit.pipe_offspring_flow_report(gen)
                 
                 batch_lengths_jit(c_pop, D, c_fit)
                 
@@ -1847,24 +2603,176 @@ class r0927480:
                 top_elite_count = min(3, len(elite_indices))
                 for i in range(top_elite_count):
                     idx = elite_indices[i]
+                    old_len = tour_length_jit(c_pop[idx], D)  # LS前长度
                     # 根据问题规模选择参数
                     kicks = 5 if n < 400 else (3 if n < 700 else 2)
-                    c_pop[idx], c_fit[idx] = iterated_lk(
+                    c_pop[idx], _ = iterated_lk(
                         c_pop[idx], D_ls, enhanced_knn,  # 使用增强候选集
                         max_kicks=kicks, lk_depth=5, lk_branch=8, lk_iters=300
                     )
+                    c_fit[idx] = tour_length_jit(c_pop[idx], D)  # 硬伤B修复：用真实D统一标尺
+                    # 【审计】LS 收益记录（传递完整参数用于 LS-SAMPLE）
+                    if audit:
+                        audit.ls_record(old_len - c_fit[idx], old_len, c_fit[idx])
                 
-                # 其余精英使用快速 VND
+                # 其余精英使用快速 VND - 【改进】两段式 LS
                 for i in range(top_elite_count, len(elite_indices)):
                     idx = elite_indices[i]
+                    old_len = c_fit[idx]  # batch_lengths_jit 已计算
+                    
+                    # 【审计】LS overwrite：记录 LS 前的 hash（每 100 代抽样第一个）
+                    hash_before = None
+                    if audit and gen % 100 == 0 and i == top_elite_count:
+                        hash_before = audit._tour_hash(c_pop[idx])
+                    
                     dlb_mask[:] = False
-                    self._vnd_or_opt_inplace(c_pop[idx], D_ls, knn_idx, dlb_mask, exploit_ls, 3, main_pos_buffer, main_tour_buffer)
+                    
+                    # =========================================================
+                    # 【两段式 LS】
+                    # Phase 1: 用 D_ls (GLS 扰动) 把你从坑里推出来
+                    # Phase 2: 用 D (真实距离) 把真实距离收回来
+                    # =========================================================
+                    
+                    # Phase 1: D_ls 扰动（短暂，探索新区域）
+                    vnd_passes, vnd_imps = self._vnd_or_opt_inplace(
+                        c_pop[idx], D_ls, knn_idx, dlb_mask, 
+                        max(exploit_ls // 2, 3), 2,  # 减半迭代
+                        main_pos_buffer, main_tour_buffer
+                    )
+                    
+                    # 【GLS 验证 print】抽样比较 gain_D vs gain_Dls（每 100 代抽样 1 次）
+                    if audit and gen % 100 == 0 and i == top_elite_count:
+                        len_after_dls = tour_length_jit(c_pop[idx], D)
+                        len_after_dls_on_dls = tour_length_jit(c_pop[idx], D_ls) if D_ls is not None else 0
+                        gain_on_D = old_len - len_after_dls
+                        audit._log(f"[GLS-VERIFY] gen={gen} | Phase1 D_ls | old={old_len:.0f} | "
+                                   f"new_D={len_after_dls:.0f} | gain_D={gain_on_D:.0f}")
+                    
+                    # Phase 2: D 回收（用真实距离做 descent，把真实距离收回来）
+                    dlb_mask[:] = False
+                    vnd_passes2, vnd_imps2 = self._vnd_or_opt_inplace(
+                        c_pop[idx], D, knn_idx, dlb_mask, 
+                        max(exploit_ls // 2, 3), 2,  # 减半迭代
+                        main_pos_buffer, main_tour_buffer
+                    )
+                    
+                    # 合并统计
+                    vnd_passes += vnd_passes2
+                    vnd_imps += vnd_imps2
+                    
+                    # 【审计】LS overwrite：记录 LS 后的 hash
+                    hash_after_ls = None
+                    if hash_before is not None:
+                        hash_after_ls = audit._tour_hash(c_pop[idx])
+                    
                     c_fit[idx] = tour_length_jit(c_pop[idx], D)
+                    
+                    # 【审计】LS overwrite：记录写回后的 hash（用于检测 LS 是否被覆盖）
+                    if hash_before is not None:
+                        hash_after_writeback = audit._tour_hash(c_pop[idx])
+                        audit.ls_overwrite_audit(gen, hash_before, hash_after_ls, hash_after_writeback)
+                    
+                    # 【审计】LS 收益记录 + VND 步数
+                    if audit:
+                        audit.ls_record(old_len - c_fit[idx], old_len, c_fit[idx], vnd_passes, vnd_imps)
+                
+                # =========================================================================
+                # 【第四刀】垃圾驯化 (Trash Taming)
+                # 对最差的 20% 子代（如果 fit > best*1.5）运行轻量级 VND
+                # =========================================================================
+                sorted_indices = np.argsort(c_fit)
+                n_trash = int(lam * 0.2)
+                trash_indices = sorted_indices[-n_trash:]  # 最差的 20%
+                
+                trash_tamed = 0
+                for idx in trash_indices:
+                    if c_fit[idx] > best_ever_fitness * 1.5:  # 只有真的很差才救
+                        dlb_mask[:] = False
+                        # 非常轻量级 VND：max_iters=50, block_steps=1
+                        self._vnd_or_opt_inplace(c_pop[idx], D, knn_idx, dlb_mask, 50, 1, main_pos_buffer, main_tour_buffer)
+                        c_fit[idx] = tour_length_jit(c_pop[idx], D)
+                        trash_tamed += 1
+                
+                # 【审计】垃圾驯化统计（每 50 代）
+                if audit and gen % 50 == 0 and trash_tamed > 0:
+                    audit._log(f"[TAME] trash_taming | gen={gen} | tamed={trash_tamed}/{n_trash}")
+                
+                # 【审计】PIPE tamed 统计
+                if audit:
+                    audit.pipe_record('tamed', trash_tamed)
 
                 cur_best_idx = np.argmin(fitness)
+                
+                # RTR 拒绝原因统计（每代累计，每 50 代输出）
+                rtr_worse = 0       # res_code=0: 孩子比目标差
+                rtr_success = 0     # res_code=1: 成功替换
+                rtr_clone = 0       # res_code=2: 完全克隆拒绝
+                rtr_near_clone = 0  # res_code=3: 近克隆拒绝
+                rtr_protected = 0   # res_code=4: 保护最优
+                
+                # 计算 top 10% 精英索引（用于保护）
+                n_elite_protect = max(1, int(lam * 0.1))
+                elite_protect_set = set(np.argsort(fitness)[:n_elite_protect])
+                structure_threshold_rtr = max(10, n // 75)  # 约 1-2% 的边不同
+                
                 for i in range(lam):
-                    better, tidx = rtr_challenge_jit(c_pop[i], c_fit[i], population, fitness, min(lam, 50), int(self.rng.integers(0, 1<<30)), cur_best_idx)
-                    if better: population[tidx][:], fitness[tidx] = c_pop[i][:], c_fit[i]
+                    # 使用 V2：带克隆封杀和严格比较
+                    better, tidx, res_code, min_dist = rtr_challenge_jit_v2(
+                        c_pop[i], c_fit[i], population, fitness, 
+                        min(lam, 50), int(self.rng.integers(0, 1<<30)), 
+                        cur_best_idx, best_ever_fitness
+                    )
+                    
+                    # 统计拒绝原因
+                    if res_code == 0: rtr_worse += 1
+                    elif res_code == 1: rtr_success += 1
+                    elif res_code == 2: rtr_clone += 1
+                    elif res_code == 3: rtr_near_clone += 1
+                    elif res_code == 4: rtr_protected += 1
+                    
+                    # 【改进】精英保护：不替换 top 10% 精英
+                    if tidx in elite_protect_set and not better:
+                        # 如果 target 是精英但替换条件不满足，跳过
+                        continue
+                    
+                    # 【改进】结构阈值提升：min_dist >= structure_threshold_rtr
+                    if min_dist < structure_threshold_rtr and not better:
+                        # 结构太近且不是明显更好，跳过
+                        continue
+                    
+                    # 【审计】记录 RTR target 质量（无论是否替换）
+                    if audit:
+                        target_fit_snap = float(fitness[tidx])
+                        audit.rtr_target_record(target_fit_snap, better)
+                        audit.pipe_record('submitted', 1)  # 统计提交 RTR 的数量
+                    
+                    if better:
+                        # 【关键修复】在写回前获取快照（转为 float 确保是标量）
+                        child_len_snapshot = float(c_fit[i])
+                        target_len_snapshot = float(fitness[tidx])
+                        delta = target_len_snapshot - child_len_snapshot  # 正值表示 child 更好
+                        
+                        # 硬断言：确保没有逻辑错误
+                        if not (child_len_snapshot < target_len_snapshot - 1e-6):
+                            print(f"FATAL: RTR Logic Error! Child {child_len_snapshot} >= Target {target_len_snapshot}")
+                        
+                        # 【审计】RTR 记录（在写回前调用！）
+                        if audit:
+                            audit.rtr_record(True, delta, child_len_snapshot, target_len_snapshot, tidx)
+                            audit.pipe_record('accepted', 1)  # 统计 RTR 接收数量
+                        
+                        # 写回
+                        population[tidx][:], fitness[tidx] = c_pop[i][:], c_fit[i]
+                
+                # 【审计】RTR 拒绝原因报告（每 50 代）
+                if audit and gen % 50 == 0:
+                    # [RTR] rejection_reasons
+                    audit._log(f"[RTR] rejection_reasons | gen={gen} | success={rtr_success} | worse={rtr_worse} | "
+                               f"clone={rtr_clone} | near_clone={rtr_near_clone} | protected={rtr_protected}")
+                    
+                    # [RTR-EFF] 效率统计：submitted=lam（闸门后）, accepted=rtr_success, success_rate
+                    success_rate = rtr_success / max(1, lam)
+                    audit._log(f"[RTR-EFF] gen={gen} | submitted={lam} | accepted={rtr_success} | success_rate={success_rate:.1%}")
                 
                 best_idx = np.argmin(fitness); bestObjective = float(fitness[best_idx])
                 
@@ -1878,6 +2786,10 @@ class r0927480:
                 # 2. 判定是否打破"历史"最优（用于记录和报告）
                 if bestObjective < best_ever_fitness:
                     print(f"[Gen {gen}] 新最优! {best_ever_fitness:.2f} -> {bestObjective:.2f} (提升 {best_ever_fitness - bestObjective:.2f})")
+                    # 【审计】best 更新事件
+                    if audit:
+                        audit.best_update_event(gen, 'GA-child', best_ever_fitness, bestObjective,
+                                                population[best_idx], lkh_tour, D)
                     best_ever_fitness = bestObjective
                     best_tour_ever = population[best_idx].copy()
                     stagnation_counter = 0  # 打破历史记录当然也清零
@@ -1887,17 +2799,124 @@ class r0927480:
                     try: q_to_scout.put_nowait(population[best_idx].copy()); last_patient_sent_time = time.time()
                     except queue.Full: pass
                 
-                if stagnation_counter >= max(30, int(stagnation_limit * 0.6)):
+                # =========================================================================
+                # 【第一刀】多源重填清洗 (Multi-Source Purge)
+                # 当 median > best * 1.5 时清洗后 30% 个体
+                # =========================================================================
+                if gen % 50 == 0:  # 每 50 代检查一次
+                    med = np.median(fitness)
+                    purge_trigger = med > best_ever_fitness * 1.5 and (gen - last_purge_gen > 200)
+                    
+                    if purge_trigger:
+                        print(f"[PURGE] Gen={gen} 触发! Median={med:.0f} (x{med/best_ever_fitness:.2f} best)")
+                        
+                        # 清洗后 30%
+                        n_purge = int(lam * 0.3)
+                        sorted_fit_indices = np.argsort(fitness)
+                        worst_indices = sorted_fit_indices[-n_purge:]
+                        
+                        refilled = 0
+                        scout_used = 0
+                        
+                        for purge_idx in worst_indices:
+                            # 策略混合
+                            try:
+                                new_tour = q_from_scout.get_nowait()
+                                scout_used += 1
+                            except queue.Empty:
+                                if self.rng.random() < 0.5:
+                                    # RCL 引入结构多样性
+                                    new_tour = _rcl_nn_tour_jit(D, finite_mask, knn_idx, 15)
+                                else:
+                                    # Best 破坏性重构（3次双桥）
+                                    new_tour = best_tour_ever.copy()
+                                    for _ in range(3):
+                                        new_tour = double_bridge_move(new_tour)
+                                    # 随机翻转一段
+                                    u_flip = int(self.rng.integers(0, n-1))
+                                    v_flip = int(self.rng.integers(u_flip+1, n))
+                                    new_tour[u_flip:v_flip+1] = new_tour[u_flip:v_flip+1][::-1]
+                            
+                            # 护栏：反克隆检查
+                            dist = bond_distance_jit(new_tour, best_tour_ever)
+                            if dist < 20:
+                                # 太像了，强制 RCL
+                                new_tour = _rcl_nn_tour_jit(D, finite_mask, knn_idx, 20)
+                            
+                            # 写入
+                            population[purge_idx][:] = new_tour[:]
+                            fitness[purge_idx] = tour_length_jit(new_tour, D)
+                            refilled += 1
+                        
+                        last_purge_gen = gen
+                        print(f"[PURGE] Refilled {refilled} (Scout={scout_used}). Median: {med:.0f} -> {np.median(fitness):.0f}")
+                        
+                        # 【审计】清洗事件
+                        if audit:
+                            new_med = np.median(fitness)
+                            audit._log(f"[PURGE] purge_event | gen={gen} | refilled={refilled} | scout={scout_used} | "
+                                       f"med_before={med:.0f} | med_after={new_med:.0f}")
+                
+                # ✅ 修复1：GLS 强制启动逻辑 + 大幅提高更新频率 + 【改进】alpha 限幅平滑
+                if gen > 1000 or stagnation_counter >= max(30, int(stagnation_limit * 0.6)):
                     if not gls_active:
                         print(f"[Gen {gen}] GLS 激活 (停滞 {stagnation_counter})")
+                        # 【审计】GLS 激活事件
+                        if audit:
+                            audit.gls_state_change(gen, True, stagnation_counter)
+                        # 初始化 alpha EMA
+                        gls_alpha = 0.03  # 初始 alpha
+                        gls_alpha_ema = 0.0  # EMA 用于平滑
                     gls_active = True
-                    if gen % 50 == 0:
+                    
+                    # 💥 关键修改：从 50 改为 5！加速惩罚累积
+                    # 如果停滞非常严重，甚至每代都更新
+                    update_freq = 5 if stagnation_counter < stagnation_limit else 1
+                    
+                    if gen % update_freq == 0:
                         self._gls_update_penalties(population[best_idx], D, gls_penalties)
-                        D_gls = np.ascontiguousarray(D + (0.03 * (bestObjective / n)) * gls_penalties)
+                        
+                        # =========================================================
+                        # 【改进】alpha 自适应 + 限幅 + EMA 平滑
+                        # =========================================================
+                        # 计算当前惩罚强度比例
+                        n_penalized = np.sum(gls_penalties > 0)
+                        penalty_ratio = n_penalized / max(1, n * n)
+                        
+                        # EMA 平滑（0.9 旧值 + 0.1 新值）
+                        if 'gls_alpha_ema' not in dir():
+                            gls_alpha_ema = penalty_ratio
+                        else:
+                            gls_alpha_ema = 0.9 * gls_alpha_ema + 0.1 * penalty_ratio
+                        
+                        # 自适应调整：惩罚太多则降低 alpha，太少则提高
+                        if gls_alpha_ema > 0.1:  # 超过 10% 边被惩罚，太激进
+                            gls_alpha *= 0.8
+                        elif gls_alpha_ema < 0.02:  # 低于 2% 边被惩罚，太保守
+                            gls_alpha *= 1.2
+                        
+                        # 限幅 (0.05 ~ 5)
+                        gls_alpha = np.clip(gls_alpha, 0.05, 5.0)
+                        
+                        D_gls = np.ascontiguousarray(D + (gls_alpha * (bestObjective / n)) * gls_penalties)
+                        
+                        # 【D_ls 更新 print】每 20 代打印一次
+                        if audit and gen % 20 == 0:
+                            diff = (D_gls - D)
+                            diff_nonzero = diff[diff > 0]
+                            if len(diff_nonzero) > 0:
+                                p10, p50, p90 = np.percentile(diff_nonzero, [10, 50, 90])
+                            else:
+                                p10, p50, p90 = 0, 0, 0
+                            audit._log(f"[GLS-UPDATE] gen={gen} | alpha={gls_alpha:.3f} | ema_ratio={gls_alpha_ema:.4f} | "
+                                       f"n_penalized={n_penalized} | Dls-D P10={p10:.1f} P50={p50:.1f} P90={p90:.1f}")
                 else: gls_active = False
                 
                 if stagnation_counter >= stagnation_limit:
                     print(f"[Gen {gen}] 重启! 当前最优 {best_ever_fitness:.2f}")
+                    # 【审计】重启事件
+                    if audit:
+                        audit.restart_event(gen, best_ever_fitness, f"stagnation={stagnation_counter}")
                     # 1. 清空 Scout 发回的旧消息
                     while not q_from_scout.empty():
                         try: q_from_scout.get_nowait()
@@ -1924,7 +2943,20 @@ class r0927480:
                             mutated = double_bridge_move(mutated)
                         population[i] = mutated
                     
-                    batch_lengths_jit(population, D, fitness)                    
+                    batch_lengths_jit(population, D, fitness)
+                    
+                    # 【关键修复】精英注入：将 best_tour_ever 强制注入种群
+                    # 防止"最好结构在真空中"的问题
+                    fit_min_before = fitness.min()
+                    worst_idx = np.argmax(fitness)
+                    population[worst_idx] = best_tour_ever.copy()
+                    fitness[worst_idx] = best_ever_fitness
+                    
+                    # 【审计】精英注入事件
+                    if audit:
+                        best_rank = np.sum(fitness < best_ever_fitness) + 1
+                        audit._log(f"[ELITE] injected | gen={gen} | fit_min_before={fit_min_before:.2f} | "
+                                   f"fit_min_after={fitness.min():.2f} | best_rank={best_rank}/{lam}")                    
                     # 4. 让 Scout 也同步到新区域
                     try:
                         q_to_scout.put_nowait(population[np.argmin(fitness)].copy())
@@ -1938,6 +2970,45 @@ class r0927480:
                     current_run_best = fitness.min()  # 让新种群从新起点开始计算
                     stagnation_counter = 0
 
+                # 【审计】周期性统计触发
+                if audit:
+                    # 每 50 代：RTR 接纳画像 + 种群质量画像
+                    if gen % 50 == 0:
+                        audit.rtr_acceptance_profile(gen, lam)
+                        audit.pop_quality_profile(gen, fitness, best_ever_fitness)
+                    
+                    # 每 100 代：多样性分位数、LS 收益、时间预算、候选边利用率
+                    if gen % 100 == 0:
+                        audit.pop_diversity_quantiles(gen, population, best_tour_ever)
+                        audit.ls_gain_profile(gen)
+                        audit.time_stage_budget(gen)
+                        # P4: 候选边利用率
+                        audit.cand_usage_report(gen, best_tour_ever, lkh_tour, knn_idx, D)
+                    
+                    # GLS 激活时：标尺一致性审计
+                    if gls_active and gen % 50 == 0:
+                        D_ls = D_gls if D_gls is not None else D
+                        audit.chk_objective_audit(gen, gls_active, best_tour_ever, D, D_ls, fitness)
+                
+                # 【诊断】周期性输出与 LKH3 最佳路径的对比报告（保留原有诊断）
+                if DIAGNOSE_AVAILABLE and gen % diagnose_interval == 0:
+                    # 一致性检查：确保 best_tour_ever 和 best_ever_fitness 匹配
+                    true_len = tour_length_jit(best_tour_ever, D)
+                    if abs(true_len - best_ever_fitness) > 1e-6:
+                        print(f"BUG: best_tour_ever 与 best_ever_fitness 不一致! tour={true_len:.2f}, fit={best_ever_fitness:.2f}")
+                    
+                    # 使用 diagnose_full 进行基础诊断（边相似度、候选覆盖率等）
+                    quick_diagnose(best_tour_ever, D, knn_idx=knn_idx, label=f"Gen {gen}")
+                    # 使用 advanced_diagnose 进行高级诊断（种群多样性、GLS状态等）
+                    advanced_diagnose(
+                        best_tour_ever, D, 
+                        population=population, 
+                        gls_penalties=gls_penalties,
+                        scout_accepted=scout_accepted, 
+                        scout_total=scout_total,
+                        label=f"Gen {gen}"
+                    )
+                
                 # 报告时使用全局最优解 best_tour_ever
                 start_pos = np.where(best_tour_ever == 0)[0]
                 bestSolution = np.concatenate((best_tour_ever[start_pos[0]:], best_tour_ever[:start_pos[0]])) if start_pos.size > 0 else best_tour_ever
@@ -1945,19 +3016,35 @@ class r0927480:
                 if self.reporter.report(float(fitness.mean()), best_ever_fitness, bestSolution) < 0: break
             return 0
         finally:
+            # 【审计】关闭日志文件
+            if audit:
+                audit.close()
             if scout_process.is_alive(): scout_process.terminate(); scout_process.join()
 
     def _vnd_or_opt_inplace(self, tour, D, knn_idx, dlb_mask, max_iters, block_steps, pos_buf, tour_buf):
+        """
+        VND (Variable Neighborhood Descent) Or-opt
+        
+        返回: (passes, improvements) 用于诊断
+        """
         improved = True
+        passes = 0
+        improvements = 0
         while improved:
             improved = False; dlb_mask[:] = False
-            if _candidate_or_opt_jit(tour, D, knn_idx, pos_buf, tour_buf, max_iters, dlb_mask, 1): improved = True; continue
+            passes += 1
+            if _candidate_or_opt_jit(tour, D, knn_idx, pos_buf, tour_buf, max_iters, dlb_mask, 1): 
+                improved = True; improvements += 1; continue
             dlb_mask[:] = False
-            if _candidate_block_swap_jit(tour, D, knn_idx, pos_buf, tour_buf, block_steps, dlb_mask, 2): improved = True; continue
+            if _candidate_block_swap_jit(tour, D, knn_idx, pos_buf, tour_buf, block_steps, dlb_mask, 2): 
+                improved = True; improvements += 1; continue
             dlb_mask[:] = False
-            if _candidate_or_opt_jit(tour, D, knn_idx, pos_buf, tour_buf, block_steps, dlb_mask, 2): improved = True; continue
+            if _candidate_or_opt_jit(tour, D, knn_idx, pos_buf, tour_buf, block_steps, dlb_mask, 2): 
+                improved = True; improvements += 1; continue
             dlb_mask[:] = False
-            if _candidate_or_opt_jit(tour, D, knn_idx, pos_buf, tour_buf, block_steps, dlb_mask, 3): improved = True; continue
+            if _candidate_or_opt_jit(tour, D, knn_idx, pos_buf, tour_buf, block_steps, dlb_mask, 3): 
+                improved = True; improvements += 1; continue
+        return passes, improvements
 
     def _gls_update_penalties(self, tour, D, penalties):
         n, max_util = tour.shape[0], -1.0
