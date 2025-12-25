@@ -441,6 +441,127 @@ def _candidate_or_opt_jit(tour, D, knn_idx, pos_buf, tour_buf, max_iters=100, dl
 
 
 @njit(cache=True, fastmath=True)
+def _candidate_2opt_jit(tour, D, knn_idx, pos_buf, max_iters=100, dlb_mask=None):
+    """
+    Candidate 2-opt：对称 TSP 的边交换 + 段反转
+    
+    对每个节点 a=tour[i]，从 knn_idx[a] 中找候选节点 c，
+    计算 delta = D[a,c] + D[b,d] - D[a,b] - D[c,d]
+    若 delta < -eps，则反转 tour[i+1:j+1]
+    
+    Args:
+        tour: 路径数组（会被原地修改）
+        D: 距离矩阵
+        knn_idx: KNN 候选索引
+        pos_buf: 位置 buffer（外部传入，零分配）
+        max_iters: 最大迭代次数
+        dlb_mask: Don't Look Bits（可选）
+    
+    Returns:
+        bool: 是否有改进
+    """
+    n = tour.shape[0]
+    K = knn_idx.shape[1]
+    eps = 1e-6
+    
+    # 建立位置映射
+    for i in range(n):
+        pos_buf[tour[i]] = i
+    
+    improved = False
+    use_dlb = (dlb_mask is not None)
+    
+    for _ in range(max_iters):
+        found_in_iter = False
+        start = np.random.randint(0, n)
+        
+        for offset in range(n):
+            i = (start + offset) % n
+            a = tour[i]
+            
+            if use_dlb and dlb_mask[a]:
+                continue
+            
+            b = tour[(i + 1) % n]
+            
+            # 检查边 (a, b) 可行性
+            if not np.isfinite(D[a, b]):
+                continue
+            
+            move_found = False
+            
+            # 遍历 a 的 KNN 候选
+            for k in range(K):
+                c = knn_idx[a, k]
+                if c == -1:
+                    break
+                
+                j = pos_buf[c]
+                
+                # 跳过相邻和无效位置
+                # 2-opt 要求 i < j 且不相邻
+                if j <= i or j == (i + 1) % n or j == i:
+                    continue
+                
+                d = tour[(j + 1) % n]
+                
+                # 检查新边可行性
+                if not np.isfinite(D[c, d]) or not np.isfinite(D[a, c]) or not np.isfinite(D[b, d]):
+                    continue
+                
+                # 计算 delta
+                # 移除边: (a, b) 和 (c, d)
+                # 添加边: (a, c) 和 (b, d)
+                delta = D[a, c] + D[b, d] - D[a, b] - D[c, d]
+                
+                if delta < -eps:
+                    # 执行 2-opt：反转 tour[i+1 : j+1]
+                    # 这会将路径从 ...a-b-...-c-d... 变为 ...a-c-...-b-d...
+                    left = (i + 1) % n
+                    right = j
+                    
+                    # 反转段 [left, right]
+                    if left < right:
+                        # 正常情况：反转中间段
+                        tour[left:right+1] = tour[left:right+1][::-1]
+                    else:
+                        # 跨越边界（环形）：不常见，跳过以保持简洁
+                        # 对称 TSP 通常不会遇到这种情况
+                        continue
+                    
+                    # 更新位置映射（反转后的节点位置变化）
+                    for idx in range(left, right + 1):
+                        pos_buf[tour[idx]] = idx
+                    
+                    improved = True
+                    move_found = True
+                    found_in_iter = True
+                    
+                    # 更新 DLB
+                    if use_dlb:
+                        dlb_mask[a] = False
+                        dlb_mask[b] = False
+                        dlb_mask[c] = False
+                        dlb_mask[d] = False
+                        # 反转段内的所有节点都需要重新检查
+                        for idx in range(left, right + 1):
+                            dlb_mask[tour[idx]] = False
+                    
+                    break
+            
+            if move_found:
+                continue
+            else:
+                if use_dlb:
+                    dlb_mask[a] = True
+        
+        if not found_in_iter and use_dlb:
+            break
+    
+    return improved
+
+
+@njit(cache=True, fastmath=True)
 def _candidate_block_swap_jit(tour, D, knn_idx, pos_buf, tour_buf, max_iters=50, dlb_mask=None, block_size=2):
     """内存优化版 Block Swap：接收外部 buffer，零内存分配"""
     n = tour.shape[0]
@@ -1384,6 +1505,13 @@ def scout_worker(D, q_in, q_out, is_symmetric):
             dlb_mask[:], improved, block_steps = False, True, 10
             while improved:
                 improved = False; dlb_mask[:] = False
+                # ✅ Candidate 2-opt (仅对称 TSP)
+                if is_symmetric:
+                    if _candidate_2opt_jit(candidate, D, knn_idx, pos_buffer, 5000, dlb_mask):
+                        improved = True
+                        continue
+                    dlb_mask[:] = False
+                # Or-opt(1) - 主力邻域
                 if _candidate_or_opt_jit(candidate, D, knn_idx, pos_buffer, tour_buffer, 5000, dlb_mask, 1): improved = True; continue
                 dlb_mask[:] = False
                 if _candidate_block_swap_jit(candidate, D, knn_idx, pos_buffer, tour_buffer, block_steps, dlb_mask, 2): improved = True; continue
@@ -1626,12 +1754,41 @@ class r0927480:
                 
                 for idx in elite_indices:
                     dlb_mask[:] = False
-                    self._vnd_or_opt_inplace(c_pop[idx], D_ls, knn_idx, dlb_mask, exploit_ls, 3, main_pos_buffer, main_tour_buffer)
+                    self._vnd_or_opt_inplace(c_pop[idx], D_ls, knn_idx, dlb_mask, exploit_ls, 3, main_pos_buffer, main_tour_buffer, is_symmetric)
                     c_fit[idx] = tour_length_jit(c_pop[idx], D)
                 
-                # === VND 证书验证：检查best_tour_ever是否真的达到局部最优（elite LS之后） ===
+                # === VND 证书验证 + Sanity Check（P0.1）===
                 if gen % 50 == 0:
                     vnd_cert_gain, vnd_cert_type = compute_knn_best_gain(best_tour_ever, D, knn_idx)
+                
+                # === P0.1: VND 证书验真测试（每100代）- 调试1 ===
+                if gen % 100 == 0 and gen > 0:
+                    # 测试：使用可行的扰动（Double Bridge + 可行2-opt）
+                    corrupted = self._corrupt_tour_for_testing(best_tour_ever, D, finite_mask)
+                    
+                    # 验证扰动后的tour是否可行
+                    is_feasible = _tour_feasible_jit(corrupted, finite_mask)
+                    
+                    if is_feasible:
+                        # 扰动成功且可行，检查证书
+                        corrupted_cost = tour_length_jit(corrupted, D)
+                        best_cost = tour_length_jit(best_tour_ever, D)
+                        is_optimal_corrupted, gain_corrupted, type_corrupted = self._vnd_sanity_check(corrupted, D, knn_idx)
+                        
+                        # 验收：可行但更差的tour，VND必须检测到改进
+                        if is_optimal_corrupted:
+                            # 失败：证书声称打坏的tour是最优的，这明显错误
+                            print(f"⚠️ Gen {gen}: VND Sanity FAILED! 可行扰动被判定为最优 (cost diff={corrupted_cost-best_cost:.2f})")
+                            log_file.write(f"⚠️ Gen {gen}: VND Sanity FAILED! Feasible corrupted marked as optimal (gain={gain_corrupted:.2f}, cost_diff={corrupted_cost-best_cost:.2f})\n")
+                            log_file.flush()
+                        else:
+                            # 成功：证书正确检测到可改进
+                            log_file.write(f"✓ Gen {gen}: VND Sanity PASSED (Corrupted gain={gain_corrupted:.2f}, cost_diff={corrupted_cost-best_cost:.2f})\n")
+                            log_file.flush()
+                    else:
+                        # 扰动失败（不可行），标记为INVALID
+                        log_file.write(f"⊘ Gen {gen}: VND Sanity INVALID (扰动后不可行，跳过测试)\n")
+                        log_file.flush()
 
                 cur_best_idx = np.argmin(fitness)
                 for i in range(lam):
@@ -1735,10 +1892,17 @@ class r0927480:
         finally:
             if scout_process.is_alive(): scout_process.terminate(); scout_process.join()
 
-    def _vnd_or_opt_inplace(self, tour, D, knn_idx, dlb_mask, max_iters, block_steps, pos_buf, tour_buf):
+    def _vnd_or_opt_inplace(self, tour, D, knn_idx, dlb_mask, max_iters, block_steps, pos_buf, tour_buf, is_symmetric):
         improved = True
         while improved:
             improved = False; dlb_mask[:] = False
+            # ✅ Candidate 2-opt (仅对称 TSP)
+            if is_symmetric:
+                if _candidate_2opt_jit(tour, D, knn_idx, pos_buf, max_iters, dlb_mask):
+                    improved = True
+                    continue
+                dlb_mask[:] = False
+            # Or-opt(1) - 主力邻域
             if _candidate_or_opt_jit(tour, D, knn_idx, pos_buf, tour_buf, max_iters, dlb_mask, 1): improved = True; continue
             dlb_mask[:] = False
             if _candidate_block_swap_jit(tour, D, knn_idx, pos_buf, tour_buf, block_steps, dlb_mask, 2): improved = True; continue
@@ -1758,6 +1922,56 @@ class r0927480:
         for i in range(n):
             a, b = tour[i], tour[(i + 1) % n]
             if np.isfinite(D[a, b]) and (D[a, b] / (1.0 + penalties[a, b])) >= max_util - 1e-12: penalties[a, b] += 1
+
+    def _vnd_sanity_check(self, tour, D, knn_idx, test_name=""):
+        """
+        VND 证书验真测试
+        
+        Returns:
+            is_local_optimal: bool - 是否达到局部最优（无可改进 move）
+            gain: float - 最佳改进值
+            move_type: int - 移动类型
+        """
+        gain, move_type = compute_knn_best_gain(tour, D, knn_idx)
+        is_local_optimal = (move_type == 0)
+        
+        return is_local_optimal, gain, move_type
+    
+    def _corrupt_tour_for_testing(self, tour, D, finite_mask):
+        """
+        使用可行的扰动方法打坏 tour（调试1）
+        
+        Args:
+            tour: 原始路径
+            D: 距离矩阵
+            finite_mask: 可行边mask
+        
+        Returns:
+            corrupted_tour: 打坏但保证可行的路径
+        """
+        # 使用 Double Bridge 保证可行性（不破坏边的可行性）
+        corrupted = double_bridge_move(tour.copy())
+        
+        # 再做几次可行的2-opt改进尝试（让它变"更差"一点）
+        # 这里故意做"反向"：选择让cost增加的2-opt
+        n = len(corrupted)
+        for _ in range(5):  # 尝试5次
+            i = self.rng.integers(0, n-1)
+            j = self.rng.integers(i+2, n)
+            
+            # 检查2-opt后是否仍然可行
+            # 原边: (tour[i], tour[i+1]), (tour[j], tour[j+1])
+            # 新边: (tour[i], tour[j]), (tour[i+1], tour[j+1])
+            i_next = (i + 1) % n
+            j_next = (j + 1) % n
+            
+            if (finite_mask[corrupted[i], corrupted[j]] and 
+                finite_mask[corrupted[i_next], corrupted[j_next]]):
+                # 执行2-opt反转
+                corrupted[i+1:j+1] = corrupted[i+1:j+1][::-1]
+                break
+        
+        return corrupted
 
 if __name__ == '__main__':
     multiprocessing.freeze_support()
