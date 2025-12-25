@@ -21,6 +21,56 @@ try:
 except:
     pass
 
+# === LKH 诊断辅助函数 ===
+def load_lkh_route(filename):
+    """加载 LKH3 最佳路径（每行一个节点索引）"""
+    route = []
+    try:
+        with open(filename, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    route.append(int(line))
+        # 如果最后一个节点等于第一个节点（回到起点），则去除
+        if len(route) > 1 and route[-1] == route[0]:
+            route = route[:-1]
+        return np.array(route, dtype=np.int32)
+    except:
+        return None
+
+def diagnose_knn_coverage(lkh_tour, knn_idx):
+    """检查 LKH3 使用的边有多少被 KNN 候选覆盖"""
+    n = len(lkh_tour)
+    K = knn_idx.shape[1]
+    # 将 knn_idx 转为快速查找结构
+    candidate_sets = [set(knn_idx[i, knn_idx[i] != -1]) for i in range(n)]
+    
+    covered = 0
+    for i in range(n):
+        u, v = lkh_tour[i], lkh_tour[(i + 1) % n]
+        # 检查 u->v 或 v->u 是否在候选中（无向）
+        if v in candidate_sets[u] or u in candidate_sets[v]:
+            covered += 1
+    
+    return covered / n
+
+def diagnose_edge_overlap(my_tour, lkh_tour):
+    """计算两个 tour 的边重叠率（无向）"""
+    n = len(my_tour)
+    # 建立 my_tour 的边集合（无向）
+    my_edges = set()
+    for i in range(n):
+        u, v = my_tour[i], my_tour[(i + 1) % n]
+        my_edges.add(frozenset([u, v]))
+    
+    shared = 0
+    for i in range(n):
+        u, v = lkh_tour[i], lkh_tour[(i + 1) % n]
+        if frozenset([u, v]) in my_edges:
+            shared += 1
+    
+    return shared / n
+
 # ==============================================================================
 # JIT Accelerated Helper Functions (Aligned with Baseline Logic)
 # ==============================================================================
@@ -46,7 +96,11 @@ def _ox_jit_inplace(p1, p2, child):
 
 @njit(cache=True, fastmath=True)
 def _scx_jit_inplace_ok(p1, p2, D, finite_mask, knn_idx, child, map1, map2, used):
-    """Fail-Fast SCX: 增强版 - KNN不行时尝试全图搜索 + 闭环修补"""
+    """Fail-Fast SCX: 增强版 - KNN不行时尝试全图搜索 + 闭环修补 + 反死路 Lookahead
+    
+    Returns:
+        int: 0=成功, 1=中途死路, 2=闭环失败
+    """
     n = p1.shape[0]
 
     # 1. 建立映射表
@@ -106,7 +160,48 @@ def _scx_jit_inplace_ok(p1, p2, D, finite_mask, knn_idx, child, map1, map2, used
 
         # D. 真的全图都无路可走了 (死胡同)
         if chosen == -1:
-            return False
+            return 1  # 返回错误码 1: 中途死路
+        
+        # === 新增 C：反死路 Lookahead 检查 ===
+        # 检查 chosen 是否至少有一个未访问且可行的下一跳
+        if i < n - 1:  # 不是最后一步时才检查（最后一步只需闭环）
+            has_future = False
+            # 快速扫描 chosen 的 KNN
+            for k in range(K):
+                next_nb = knn_idx[chosen, k]
+                if next_nb != -1 and (not used[next_nb]) and finite_mask[chosen, next_nb]:
+                    has_future = True
+                    break
+            
+            # 如果 KNN 里没有未来，再尝试全图扫描一次（防止 K 太小）
+            if not has_future:
+                for candidate in range(n):
+                    if not used[candidate] and finite_mask[chosen, candidate]:
+                        has_future = True
+                        break
+            
+            # 如果 chosen 无未来，尝试换用第二候选
+            if not has_future:
+                # 尝试找一个有未来的替代候选
+                alternative = -1
+                # 先从 KNN 找
+                for k in range(K):
+                    alt_nb = knn_idx[cur, k]
+                    if alt_nb != -1 and (not used[alt_nb]) and finite_mask[cur, alt_nb]:
+                        # 检查这个候选是否有未来
+                        alt_has_future = False
+                        for k2 in range(K):
+                            next_nb = knn_idx[alt_nb, k2]
+                            if next_nb != -1 and (not used[next_nb]) and finite_mask[alt_nb, next_nb]:
+                                alt_has_future = True
+                                break
+                        if alt_has_future:
+                            alternative = alt_nb
+                            break
+                
+                # 如果找到了更好的候选，替换
+                if alternative != -1:
+                    chosen = alternative
 
         child[i] = chosen
         used[chosen] = True
@@ -129,10 +224,10 @@ def _scx_jit_inplace_ok(p1, p2, D, finite_mask, knn_idx, child, map1, map2, used
                 # 执行交换
                 child[n - 1] = prev
                 child[n - 2] = last
-                return True
-        return False  # 补丁失败，放弃
+                return 0  # 成功：闭环修补成功
+        return 2  # 返回错误码 2: 闭环失败
 
-    return True
+    return 0  # 返回错误码 0: 成功
 
 @njit(cache=True, fastmath=True)
 def tour_length_jit(tour, D):
@@ -218,19 +313,7 @@ def _rand_perm_jit(n):
         tmp = arr[i]; arr[i] = arr[j]; arr[j] = tmp
     return arr
 
-@njit(cache=True, fastmath=True)
-def double_bridge_move(tour):
-    n = tour.shape[0]
-    if n < 8: return tour.copy()
-    p1 = np.random.randint(1, n // 4)
-    p2 = np.random.randint(p1 + 1, n // 2)
-    p3 = np.random.randint(p2 + 1, 3 * n // 4)
-    new_tour = np.empty(n, dtype=tour.dtype)
-    new_tour[:p1] = tour[:p1]
-    new_tour[p1:p1+(p3-p2)] = tour[p2:p3]
-    new_tour[p1+(p3-p2):p1+(p3-p2)+(p2-p1)] = tour[p1:p2]
-    new_tour[p1+(p3-p1):] = tour[p3:]
-    return new_tour
+
 
 @njit(cache=True, fastmath=True)
 def _make_move_opt(tour, pos, u_idx, block_size, t_idx_new, temp_buffer):
@@ -743,6 +826,127 @@ def _hybrid_ruin_and_recreate_inplace(tour, D, ruin_pct, knn_idx, mode, tour_buf
         current_len += 1
 
 
+@njit(cache=True, fastmath=True)
+def double_bridge_move(tour):
+    """
+    Double Bridge (4-opt): 强力 Kick 算子，3切点版本（Numba稳定）
+    使用 randint 抽样，避免 np.random.choice
+    """
+    n = len(tour)
+    new_tour = np.empty(n, np.int32)
+    
+    if n < 8:
+        new_tour[:] = tour[:]
+        return new_tour
+    
+    # 3切点版本：分段采样保证间隔
+    p1 = np.random.randint(1, n // 4 + 1)
+    p2 = np.random.randint(p1 + 2, n // 2 + 1)
+    p3 = np.random.randint(p2 + 2, 3 * n // 4 + 1)
+    
+    # Double Bridge: A-B-C-D → A-C-B-D
+    # A: [0, p1)
+    # B: [p1, p2)
+    # C: [p2, p3)
+    # D: [p3, n)
+    idx = 0
+    for i in range(0, p1): new_tour[idx] = tour[i]; idx += 1
+    for i in range(p2, p3): new_tour[idx] = tour[i]; idx += 1
+    for i in range(p1, p2): new_tour[idx] = tour[i]; idx += 1
+    for i in range(p3, n): new_tour[idx] = tour[i]; idx += 1
+    
+    return new_tour
+
+
+@njit(cache=True, fastmath=True)
+def compute_knn_best_gain(tour, D, knn_idx):
+    """
+    VND 证书验证：计算全 KNN 邻域的最佳 Gain
+    
+    遍历所有点 u 和它的 KNN v，计算：
+    - Or-opt(1), Or-opt(2), Or-opt(3), Swap(2)
+    
+    使用环形距离判断，避免线性距离的错误过滤
+    
+    Returns:
+        best_gain: 最佳改进值（负数表示有改进）
+        move_type: 0=无改进, 1=Or-opt(1), 2=Or-opt(2), 3=Or-opt(3), 4=Swap(2)
+    """
+    n = len(tour)
+    K = knn_idx.shape[1]
+    
+    # 建立位置索引
+    pos = np.empty(n, np.int32)
+    for i in range(n):
+        pos[tour[i]] = i
+    
+    best_gain = 0.0
+    move_type = 0
+    
+    # 遍历所有点及其 KNN
+    for u in range(n):
+        u_pos = pos[u]
+        u_prev = tour[(u_pos - 1) % n]
+        u_next = tour[(u_pos + 1) % n]
+        
+        for k in range(K):
+            v = knn_idx[u, k]
+            if v == -1 or v == u:
+                continue
+            
+            v_pos = pos[v]
+            v_prev = tour[(v_pos - 1) % n]
+            v_next = tour[(v_pos + 1) % n]
+            
+            # 计算环形距离
+            d = abs(u_pos - v_pos)
+            circ_dist = min(d, n - d)
+            
+            # === Or-opt(1): 移动单个点 u 到 v 后面 ===
+            # 只排除真正冲突的情况：u 和 v 相邻或重叠
+            if circ_dist > 2 and v != u_prev and v != u_next:
+                delta = -D[u_prev, u] - D[u, u_next] + D[u_prev, u_next]
+                delta += -D[v, v_next] + D[v, u] + D[u, v_next]
+                if delta < best_gain:
+                    best_gain = delta
+                    move_type = 1
+            
+            # === Or-opt(2): 移动2个连续点 ===
+            # 确保 u_next 不是 v，且环形距离足够
+            if u_next != v and circ_dist > 3:
+                u_next2 = tour[(u_pos + 2) % n]
+                # 排除 v 与 u 的 2-block 有重叠
+                if v != u_next2 and v != u_prev:
+                    delta = -D[u_prev, u] - D[u_next, u_next2] + D[u_prev, u_next2]
+                    delta += -D[v, v_next] + D[v, u] + D[u_next, v_next]
+                    if delta < best_gain:
+                        best_gain = delta
+                        move_type = 2
+            
+            # === Or-opt(3): 移动3个连续点 ===
+            if circ_dist > 4:
+                u_next2 = tour[(u_pos + 2) % n]
+                u_next3 = tour[(u_pos + 3) % n]
+                # 排除 v 与 u 的 3-block 有重叠
+                if v != u_next3 and v != u_next2 and v != u_prev:
+                    delta = -D[u_prev, u] - D[u_next2, u_next3] + D[u_prev, u_next3]
+                    delta += -D[v, v_next] + D[v, u] + D[u_next2, v_next]
+                    if delta < best_gain:
+                        best_gain = delta
+                        move_type = 3
+            
+            # === Swap(2): 交换 u 和 v ===
+            # 只排除 u 和 v 相邻的情况
+            if circ_dist > 1 and v != u_prev and v != u_next:
+                delta = -D[u_prev, u] - D[u, u_next] - D[v_prev, v] - D[v, v_next]
+                delta += D[u_prev, v] + D[v, u_next] + D[v_prev, u] + D[u, v_next]
+                if delta < best_gain:
+                    best_gain = delta
+                    move_type = 4
+    
+    return best_gain, move_type
+
+
 @njit(cache=True, parallel=True)
 def init_population_jit(pop, D, finite_mask, knn_idx, strat_probs, seeds, rcl_r):
     lam, n = pop.shape
@@ -771,12 +975,21 @@ def evolve_population_jit(population, c_pop, fitness, D, finite_mask, knn_idx, e
     map1_buf = np.empty(n, dtype=np.int32)
     map2_buf = np.empty(n, dtype=np.int32)
     used_buf = np.empty(n, dtype=np.bool_)
+    backup_buf = np.empty(n, dtype=np.int32)  # 变异回滚备份
     
     # === 诊断统计 ===
-    scx_fail_count = 0  # SCX 返回 False 的次数
-    rcl_fallback_count = 0  # 用 RCL 覆盖 child 的次数
-    mut_infeasible_count = 0  # ATSP shift 后发现 infeasible 然后被 RCL 覆盖的次数
-    total_offspring = 0  # 总子代数（用于计算比例）
+    scx_fail_count = 0
+    scx_deadend_count = 0
+    scx_closure_fail_count = 0
+    rcl_fallback_count = 0
+    mut_infeasible_count = 0
+    mut_rollback_count = 0
+    smart_shift_success = 0
+    smart_shift_fail = 0
+    db_attempt = 0  # Double Bridge 尝试次数
+    db_success = 0  # Double Bridge 成功次数
+    rand_shift_attempt = 0  # 随机 shift 尝试次数
+    total_offspring = 0
     
     SCX_RETRY = 3  # ATSP 重试次数
     
@@ -846,69 +1059,285 @@ def evolve_population_jit(population, c_pop, fitness, D, finite_mask, knn_idx, e
             total_offspring += 2  # 统计 ATSP 子代数
             
             # --- Child 1 ---
-            ok = False
+            result1 = 0  # 0=成功, 1=中途死路, 2=闭环失败
             for _ in range(SCX_RETRY):
-                if _scx_jit_inplace_ok(p1, p2, D, finite_mask, knn_idx, c1, map1_buf, map2_buf, used_buf):
-                    ok = True
+                result1 = _scx_jit_inplace_ok(p1, p2, D, finite_mask, knn_idx, c1, map1_buf, map2_buf, used_buf)
+                if result1 == 0:
                     break
             
-            if not ok:
-                # SCX 失败，记录统计
+            if result1 != 0:
+                # SCX 失败，分类统计
                 scx_fail_count += 1
+                if result1 == 1:
+                    scx_deadend_count += 1
+                elif result1 == 2:
+                    scx_closure_fail_count += 1
                 rcl_fallback_count += 1
                 # 彻底失败，用 RCL 生成新血 (必然可行)
                 c1[:] = _rcl_nn_tour_jit(D, finite_mask, knn_idx, 3)[:]
             else:
-                # 只有当 SCX 成功时才做变异，防止破坏可行性
-                # ATSP 变异：严禁反转，只做 Shift/Insert
+                # SCX 成功，统一备份用于回滚
+                backup_buf[:] = c1[:]
+                
+                # === 变异：10% Double Bridge + 90% Smart Shift ===
                 if np.random.random() < exploit_mut:
-                    u, v = np.random.randint(0, n), np.random.randint(0, n - 1)
-                    if v >= u: v += 1
-                    if u != v:
-                        # 简单的 Shift 变异 (In-place)
-                        city = c1[u]
-                        if v < u:
-                            for k in range(u, v, -1): c1[k] = c1[k-1]
+                    # 10% Double Bridge（强力 Kick）
+                    if np.random.random() < 0.10:
+                        db_attempt += 1
+                        mut_tour = double_bridge_move(c1)
+                        if _tour_feasible_jit(mut_tour, finite_mask):
+                            c1[:] = mut_tour[:]
+                            db_success += 1
                         else:
-                            for k in range(u, v): c1[k] = c1[k+1]
-                        c1[v] = city
+                            c1[:] = backup_buf[:]
+                    
+                    # 90% Smart Shift（改进版：O(1)定位+原地搬移）
+                    else:
+                        # 建立位置映射 O(n)
+                        for pos in range(n):
+                            map1_buf[c1[pos]] = pos
                         
-                        # 变异后必须检查可行性，不可行则用 RCL 覆盖
-                        if not _tour_feasible_jit(c1, finite_mask):
-                            mut_infeasible_count += 1
-                            rcl_fallback_count += 1
-                            c1[:] = _rcl_nn_tour_jit(D, finite_mask, knn_idx, 3)[:]
+                        found_improving = False
+                        K = knn_idx.shape[1]
+                        
+                        # u 重试最多2次
+                        for u_try in range(2):
+                            if found_improving:
+                                break
+                            
+                            # O(1) 选点：直接按位置
+                            u_pos = np.random.randint(0, n)
+                            u = c1[u_pos]
+                            u_prev = c1[(u_pos - 1) % n]
+                            u_next = c1[(u_pos + 1) % n]
+                            
+                            # 遍历 KNN 找可行且改进的插入点
+                            for k in range(K):
+                                v = knn_idx[u, k]
+                                if v == -1 or v == u or v == u_prev or v == u_next:
+                                    continue
+                                
+                                # O(1) 定位 v
+                                v_pos = map1_buf[v]
+                                v_next = c1[(v_pos + 1) % n]
+                                
+                                # 预判可行性
+                                if (finite_mask[u_prev, u_next] and 
+                                    finite_mask[v, u] and 
+                                    finite_mask[u, v_next]):
+                                    
+                                    # Delta 计算
+                                    delta = -D[u_prev, u] - D[u, u_next] + D[u_prev, u_next]
+                                    delta += -D[v, v_next] + D[v, u] + D[u, v_next]
+                                    
+                                    # 微放宽接受
+                                    accept = False
+                                    if delta <= 0.0:
+                                        accept = True
+                                    elif delta < 5.0 and np.random.random() < 0.005:
+                                        accept = True
+                                    
+                                    if accept:
+                                        # 原地搬移（remove u + insert after v）
+                                        city = u
+                                        if u_pos < v_pos:
+                                            # u 在 v 前面：先移除 u，v_pos 会减1
+                                            for i in range(u_pos, v_pos):
+                                                c1[i] = c1[i + 1]
+                                            c1[v_pos] = city
+                                        elif u_pos > v_pos:
+                                            # u 在 v 后面：先移除 u，然后插入到 v+1
+                                            for i in range(u_pos, v_pos + 1, -1):
+                                                c1[i] = c1[i - 1]
+                                            c1[v_pos + 1] = city
+                                        # u_pos == v_pos 的情况不会发生（已过滤）
+                                        
+                                        smart_shift_success += 1
+                                        found_improving = True
+                                        break
+                        
+                        if not found_improving:
+                            smart_shift_fail += 1
+                            # Feasible Kick 兜底（3% 只要求可行，O(1)定位）
+                            if np.random.random() < 0.03:
+                                u_pos = np.random.randint(0, n)
+                                u = c1[u_pos]
+                                u_prev = c1[(u_pos - 1) % n]
+                                u_next = c1[(u_pos + 1) % n]
+                                
+                                K = knn_idx.shape[1]
+                                for k in range(K):
+                                    v = knn_idx[u, k]
+                                    if v == -1 or v == u or v == u_prev or v == u_next:
+                                        continue
+                                    
+                                    v_pos = map1_buf[v]
+                                    v_next = c1[(v_pos + 1) % n]
+                                    
+                                    if (finite_mask[u_prev, u_next] and 
+                                        finite_mask[v, u] and 
+                                        finite_mask[u, v_next]):
+                                        # 可行！原地搬移
+                                        city = u
+                                        if u_pos < v_pos:
+                                            for i in range(u_pos, v_pos):
+                                                c1[i] = c1[i + 1]
+                                            c1[v_pos] = city
+                                        elif u_pos > v_pos:
+                                            for i in range(u_pos, v_pos + 1, -1):
+                                                c1[i] = c1[i - 1]
+                                            c1[v_pos + 1] = city
+                                        break
+                            # 原天5%随机shift保留
+                            elif np.random.random() < 0.05:
+                                rand_shift_attempt += 1
+                                u, v = np.random.randint(0, n), np.random.randint(0, n - 1)
+                                if v >= u: v += 1
+                                if u != v:
+                                    city = c1[u]
+                                    if v < u:
+                                        for k in range(u, v, -1): c1[k] = c1[k-1]
+                                    else:
+                                        for k in range(u, v): c1[k] = c1[k+1]
+                                    c1[v] = city
+                                    if not _tour_feasible_jit(c1, finite_mask):
+                                        c1[:] = backup_buf[:]
 
             # --- Child 2 ---
-            ok = False
+            result2 = 0  # 0=成功, 1=中途死路, 2=闭环失败
             for _ in range(SCX_RETRY):
-                if _scx_jit_inplace_ok(p2, p1, D, finite_mask, knn_idx, c2, map1_buf, map2_buf, used_buf):
-                    ok = True
+                result2 = _scx_jit_inplace_ok(p2, p1, D, finite_mask, knn_idx, c2, map1_buf, map2_buf, used_buf)
+                if result2 == 0:
                     break
             
-            if not ok:
-                # SCX 失败，记录统计
+            if result2 != 0:
                 scx_fail_count += 1
+                if result2 == 1:
+                    scx_deadend_count += 1
+                elif result2 == 2:
+                    scx_closure_fail_count += 1
                 rcl_fallback_count += 1
                 c2[:] = _rcl_nn_tour_jit(D, finite_mask, knn_idx, 3)[:]
             else:
+                # SCX 成功，统一备份用于回滚
+                backup_buf[:] = c2[:]
+                
+                # === 变异：10% Double Bridge + 90% Smart Shift ===
                 if np.random.random() < exploit_mut:
-                    u, v = np.random.randint(0, n), np.random.randint(0, n - 1)
-                    if v >= u: v += 1
-                    if u != v:
-                        city = c2[u]
-                        if v < u:
-                            for k in range(u, v, -1): c2[k] = c2[k-1]
+                    # 10% Double Bridge
+                    if np.random.random() < 0.10:
+                        db_attempt += 1
+                        mut_tour = double_bridge_move(c2)
+                        if _tour_feasible_jit(mut_tour, finite_mask):
+                            c2[:] = mut_tour[:]
+                            db_success += 1
                         else:
-                            for k in range(u, v): c2[k] = c2[k+1]
-                        c2[v] = city
-                        if not _tour_feasible_jit(c2, finite_mask):
-                            mut_infeasible_count += 1
-                            rcl_fallback_count += 1
-                            c2[:] = _rcl_nn_tour_jit(D, finite_mask, knn_idx, 3)[:]
+                            c2[:] = backup_buf[:]
+                    
+                    # 90% Smart Shift（O(1)定位+原地搬移）
+                    else:
+                        # 建立位置映射
+                        for pos in range(n):
+                            map2_buf[c2[pos]] = pos
+                        
+                        found_improving = False
+                        K = knn_idx.shape[1]
+                        
+                        for u_try in range(2):
+                            if found_improving:
+                                break
+                            
+                            # O(1) 选点
+                            u_pos = np.random.randint(0, n)
+                            u = c2[u_pos]
+                            u_prev = c2[(u_pos - 1) % n]
+                            u_next = c2[(u_pos + 1) % n]
+                            
+                            for k in range(K):
+                                v = knn_idx[u, k]
+                                if v == -1 or v == u or v == u_prev or v == u_next:
+                                    continue
+                                
+                                # O(1) 定位 v
+                                v_pos = map2_buf[v]
+                                v_next = c2[(v_pos + 1) % n]
+                                
+                                if (finite_mask[u_prev, u_next] and 
+                                    finite_mask[v, u] and 
+                                    finite_mask[u, v_next]):
+                                    
+                                    delta = -D[u_prev, u] - D[u, u_next] + D[u_prev, u_next]
+                                    delta += -D[v, v_next] + D[v, u] + D[u, v_next]
+                                    
+                                    accept = False
+                                    if delta <= 0.0:
+                                        accept = True
+                                    elif delta < 5.0 and np.random.random() < 0.005:
+                                        accept = True
+                                    
+                                    if accept:
+                                        # 原地搬移
+                                        city = u
+                                        if u_pos < v_pos:
+                                            for i in range(u_pos, v_pos):
+                                                c2[i] = c2[i + 1]
+                                            c2[v_pos] = city
+                                        elif u_pos > v_pos:
+                                            for i in range(u_pos, v_pos + 1, -1):
+                                                c2[i] = c2[i - 1]
+                                            c2[v_pos + 1] = city
+                                        
+                                        smart_shift_success += 1
+                                        found_improving = True
+                                        break
+                        
+                        if not found_improving:
+                            smart_shift_fail += 1
+                            # Feasible Kick 兜底（O(1)定位）
+                            if np.random.random() < 0.03:
+                                u_pos = np.random.randint(0, n)
+                                u = c2[u_pos]
+                                u_prev = c2[(u_pos - 1) % n]
+                                u_next = c2[(u_pos + 1) % n]
+                                
+                                K = knn_idx.shape[1]
+                                for k in range(K):
+                                    v = knn_idx[u, k]
+                                    if v == -1 or v == u or v == u_prev or v == u_next:
+                                        continue
+                                    
+                                    v_pos = map2_buf[v]
+                                    v_next = c2[(v_pos + 1) % n]
+                                    
+                                    if (finite_mask[u_prev, u_next] and 
+                                        finite_mask[v, u] and 
+                                        finite_mask[u, v_next]):
+                                        city = u
+                                        if u_pos < v_pos:
+                                            for i in range(u_pos, v_pos):
+                                                c2[i] = c2[i + 1]
+                                            c2[v_pos] = city
+                                        elif u_pos > v_pos:
+                                            for i in range(u_pos, v_pos + 1, -1):
+                                                c2[i] = c2[i - 1]
+                                            c2[v_pos + 1] = city
+                                        break
+                            elif np.random.random() < 0.05:
+                                rand_shift_attempt += 1
+                                u, v = np.random.randint(0, n), np.random.randint(0, n - 1)
+                                if v >= u: v += 1
+                                if u != v:
+                                    city = c2[u]
+                                    if v < u:
+                                        for k in range(u, v, -1): c2[k] = c2[k-1]
+                                    else:
+                                        for k in range(u, v): c2[k] = c2[k+1]
+                                    c2[v] = city
+                                    if not _tour_feasible_jit(c2, finite_mask):
+                                        c2[:] = backup_buf[:]
     
-    # 返回诊断统计
-    return scx_fail_count, rcl_fallback_count, mut_infeasible_count, total_offspring
+    # 返回诊断统计（更新返回值）
+    return scx_fail_count, scx_deadend_count, scx_closure_fail_count, rcl_fallback_count, mut_infeasible_count, mut_rollback_count, smart_shift_success, smart_shift_fail, db_attempt, db_success, rand_shift_attempt, total_offspring
 
 # ==============================================================================
 # Subprocess Worker
@@ -992,8 +1421,8 @@ class r0927480:
         lam, stagnation_limit, exploit_mut, exploit_ls = 200, 200, 0.3, 30
         if n < 300: lam, stagnation_limit = 1000, 500
         elif n < 600: lam, stagnation_limit, exploit_mut, exploit_ls = 150, 150, 0.15, 30
-        elif n < 850: lam, stagnation_limit, exploit_mut, exploit_ls = 100, 200, 0.1, 10
-        else: lam, stagnation_limit, exploit_mut, exploit_ls = 100, 150, 0.1, 10
+        elif n < 850: lam, stagnation_limit, exploit_mut, exploit_ls = 100, 200, 0.25, 10
+        else: lam, stagnation_limit, exploit_mut, exploit_ls = 100, 150, 0.25, 10
         
         D = np.ascontiguousarray(distanceMatrix)
         is_symmetric = np.allclose(D, D.T, rtol=1e-5, atol=1e-8, equal_nan=True)
@@ -1022,11 +1451,40 @@ class r0927480:
             c_pop, c_fit, dlb_mask = np.empty((lam, n), dtype=np.int32), np.empty(lam, dtype=np.float64), np.zeros(n, dtype=np.bool_)
             last_patient_sent_time = 0.0
             
-            # 诊断统计累积
+            # 诊断统计累积（总计）
             total_scx_fail = 0
+            total_scx_deadend = 0
+            total_scx_closure_fail = 0
             total_rcl_fallback = 0
             total_mut_infeasible = 0
+            total_mut_rollback = 0
+            total_smart_shift_success = 0
+            total_smart_shift_fail = 0
+            total_db_attempt = 0
+            total_db_success = 0
+            total_rand_shift_attempt = 0
             total_offspring = 0
+            
+            # 滑动窗口统计（最近50代）
+            window_scx_fail = 0
+            window_scx_deadend = 0
+            window_scx_closure_fail = 0
+            window_rcl_fallback = 0
+            window_smart_shift_success = 0
+            window_smart_shift_fail = 0
+            window_db_attempt = 0
+            window_db_success = 0
+            window_offspring = 0
+            
+            # === 加载 LKH 参考路径进行诊断 ===
+            lkh_tour = None
+            lkh_filename = filename.replace('.csv', '.txt').replace('tour', 'best_route_tour')
+            try:
+                lkh_tour = load_lkh_route(lkh_filename)
+                if lkh_tour is not None:
+                    print(f"✅ 加载 LKH 参考路径: {lkh_filename} (n={len(lkh_tour)})")
+            except:
+                print(f"⚠️ 未找到 LKH 参考路径: {lkh_filename}")
             
             # 创建时间戳命名的日志文件
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1062,23 +1520,99 @@ class r0927480:
                 D_ls = D_gls if (gls_active and D_gls is not None) else D
                 stats = evolve_population_jit(population, c_pop, fitness, D, finite_mask, knn_idx, exploit_mut, is_symmetric)
             
-                # 解包统计数据
-                scx_fail, rcl_fallback, mut_infeasible, offspring_count = stats
+                # 解包统计数据（12个返回值）
+                scx_fail, scx_deadend, scx_closure, rcl_fb, mut_inf, mut_rb, smart_succ, smart_fail, db_att, db_succ, rand_shift_att, offspring_count = stats
+                
+                # 总计累积
                 total_scx_fail += scx_fail
-                total_rcl_fallback += rcl_fallback
-                total_mut_infeasible += mut_infeasible
+                total_scx_deadend += scx_deadend
+                total_scx_closure_fail += scx_closure
+                total_rcl_fallback += rcl_fb
+                total_mut_infeasible += mut_inf
+                total_mut_rollback += mut_rb
+                total_smart_shift_success += smart_succ
+                total_smart_shift_fail += smart_fail
+                total_db_attempt += db_att
+                total_db_success += db_succ
+                total_rand_shift_attempt += rand_shift_att
                 total_offspring += offspring_count
                 
-                # 每 50 代记录一次日志
-                if gen % 50 == 0 and total_offspring > 0:
-                    feasible_rate = 1.0 - (total_rcl_fallback / total_offspring) if total_offspring > 0 else 1.0
+                # 窗口累积（最近50代）
+                window_scx_fail += scx_fail
+                window_scx_deadend += scx_deadend
+                window_scx_closure_fail += scx_closure
+                window_rcl_fallback += rcl_fb
+                window_smart_shift_success += smart_succ
+                window_smart_shift_fail += smart_fail
+                window_db_attempt += db_att
+                window_db_success += db_succ
+                window_offspring += offspring_count
+                
+                batch_lengths_jit(c_pop, D, c_fit)
+                
+                # VND 证书验证初始化（在精英LS之前）
+                vnd_cert_gain = 0.0
+                vnd_cert_type = 0
+                
+                # 每 50 代记录一次日志（使用窗口统计）
+                if gen % 50 == 0 and window_offspring > 0:
+                    feasible_rate = 1.0 - ((window_rcl_fallback) / window_offspring) if window_offspring > 0 else 1.0
+                    
+                    # === SCX 失败分类诊断（窗口） ===
+                    scx_deadend_pct = (window_scx_deadend / window_scx_fail * 100) if window_scx_fail > 0 else 0
+                    scx_closure_pct = (window_scx_closure_fail / window_scx_fail * 100) if window_scx_fail > 0 else 0
+                    smart_succ_rate = (window_smart_shift_success / (window_smart_shift_success + window_smart_shift_fail) * 100) if (window_smart_shift_success + window_smart_shift_fail) > 0 else 0
+                    
                     log_file.write(f"Gen {gen:5d} | ")
-                    log_file.write(f"SCX_fail: {total_scx_fail:4d} | ")
-                    log_file.write(f"RCL_fallback: {total_rcl_fallback:4d} | ")
-                    log_file.write(f"Mut_infeas: {total_mut_infeasible:4d} | ")
-                    log_file.write(f"Feasible_rate: {feasible_rate*100:5.2f}% | ")
+                    log_file.write(f"SCX_fail: {window_scx_fail:4d} (Dead:{scx_deadend_pct:4.1f}% Clos:{scx_closure_pct:4.1f}%) | ")
+                    log_file.write(f"RCL_fb: {window_rcl_fallback:4d} | ")
+                    log_file.write(f"Smart: {smart_succ_rate:5.1f}% ({window_smart_shift_success}/{window_smart_shift_success+window_smart_shift_fail}) | ")
+                    
+                    # === DB 统计输出（窗口） ===
+                    if window_db_attempt > 0:
+                        db_succ_rate = (window_db_success / window_db_attempt * 100) if window_db_attempt > 0 else 0
+                        log_file.write(f"DB: {db_succ_rate:4.1f}% ({window_db_success}/{window_db_attempt}) | ")
+                    
+                    log_file.write(f"Feasible: {feasible_rate*100:5.2f}% | ")
+                    
+                    # === LKH 诊断输出 ===
+                    if lkh_tour is not None:
+                        knn_cov = diagnose_knn_coverage(lkh_tour, knn_idx)
+                        edge_overlap = diagnose_edge_overlap(best_tour_ever, lkh_tour)
+                        log_file.write(f"KNN_Cov: {knn_cov*100:5.2f}% | ")
+                        log_file.write(f"LKH_Ovlp: {edge_overlap*100:5.2f}% | ")
+                        
+                        # 🚨 临界警报 🚨
+                        if knn_cov < 0.95:
+                            print(f"🚨 Gen {gen}: KNN={knn_idx.shape[1]} TOO SMALL! Coverage={knn_cov:.2%}, Missing {(1-knn_cov)*100:.1f}% optimal edges!")
+                        if knn_cov > 0.98 and edge_overlap < 0.7:
+                            print(f"⚠️ Gen {gen}: KNN够但Overlap低 ({edge_overlap:.2%})。需要更强的连接算子！")
+                    
+                    # === VND 证书验证输出 ===
+                    if gen % 50 == 0:
+                        if vnd_cert_type > 0:
+                            move_names = ["", "Or1", "Or2", "Or3", "Sw2"]
+                            log_file.write(f"VND_Cert: {vnd_cert_gain:.2f} ({move_names[vnd_cert_type]}) | ")
+                            # 警告：VND 没有找到明显改进
+                            if vnd_cert_gain < -1e-6:
+                                print(f"⚠️ Gen {gen}: VND未达局部最优！Best Gain={vnd_cert_gain:.4f} ({move_names[vnd_cert_type]})")
+                        else:
+                            # VND 达到局部最优
+                            log_file.write(f"VND: ✓ | ")
+                    
                     log_file.write(f"Best: {best_ever_fitness:.2f}\n")
                     log_file.flush()
+                    
+                    # 清零窗口统计
+                    window_scx_fail = 0
+                    window_scx_deadend = 0
+                    window_scx_closure_fail = 0
+                    window_rcl_fallback = 0
+                    window_smart_shift_success = 0
+                    window_smart_shift_fail = 0
+                    window_db_attempt = 0
+                    window_db_success = 0
+                    window_offspring = 0
                 
                 batch_lengths_jit(c_pop, D, c_fit)
             
@@ -1089,10 +1623,15 @@ class r0927480:
                 
                 elite_count = max(1, int(lam * base_elite_pct))
                 elite_indices = np.argsort(c_fit)[:elite_count]
+                
                 for idx in elite_indices:
                     dlb_mask[:] = False
                     self._vnd_or_opt_inplace(c_pop[idx], D_ls, knn_idx, dlb_mask, exploit_ls, 3, main_pos_buffer, main_tour_buffer)
                     c_fit[idx] = tour_length_jit(c_pop[idx], D)
+                
+                # === VND 证书验证：检查best_tour_ever是否真的达到局部最优（elite LS之后） ===
+                if gen % 50 == 0:
+                    vnd_cert_gain, vnd_cert_type = compute_knn_best_gain(best_tour_ever, D, knn_idx)
 
                 cur_best_idx = np.argmin(fitness)
                 for i in range(lam):
@@ -1137,13 +1676,20 @@ class r0927480:
                     gls_active = False
                     D_gls = None
                     
-                    # 3. 【70/30 混合策略】
-                    # Part A: 70% 完全重新生成（模拟手动重启 python verify_submission.py）
+                    # 3. 【70/30 混合策略 - ATSP专用优化】
+                    # Part A: 70% 完全重新生成（根据对称性调整策略）
                     reset_count = int(lam * 0.7)
-                    restart_strat_probs = np.array([0.05, 0.15, 0.8], dtype=np.float64)  # 80% 随机
+                    # ATSP 禁用 random，只用 RCL + insertion
+                    if is_symmetric:
+                        restart_strat_probs = np.array([0.05, 0.15, 0.8], dtype=np.float64)  # 对称TSP保留80%随机
+                        restart_rcl_r = int(self.rng.integers(15, 40))  # 大 r 用于多样性
+                    else:
+                        restart_strat_probs = np.array([0.7, 0.3, 0.0], dtype=np.float64)  # ATSP禁用random
+                        restart_rcl_r = int(self.rng.integers(3, 11))  # 较小 r (3-10)
+                    
                     init_population_jit(population[:reset_count], D, finite_mask, knn_idx, restart_strat_probs, 
                                         np.random.randint(0, 1<<30, reset_count).astype(np.int64), 
-                                        int(self.rng.integers(15, 40)))  # rcl_r 很大
+                                        restart_rcl_r)
                     
                     # Part B: 30% 保留旧皇血脉（1-3次双桥变异）
                     for i in range(reset_count, lam):
