@@ -562,6 +562,165 @@ def _candidate_2opt_jit(tour, D, knn_idx, pos_buf, max_iters=100, dlb_mask=None)
 
 
 @njit(cache=True, fastmath=True)
+def _candidate_blockswap3_jit(tour, D, knn_idx, pos_buf, max_iters=100, dlb_mask=None):
+    """
+    Directed 3-opt：相邻两段交换（ATSP 可用，不反转段）
+    
+    选择 3 个切点 i < j < k，将相邻两段交换位置：
+    Args:
+        tour: 路径数组（会被原地修改）
+        D: 距离矩阵
+        knn_idx: KNN 候选索引
+        pos_buf: 位置 buffer（外部传入，零分配）
+        max_iters: 最大迭代次数
+        dlb_mask: Don't Look Bits（可选）
+    
+    Returns:
+        bool: 是否有改进
+    """
+    n = tour.shape[0]
+    K = knn_idx.shape[1]
+    eps = 1e-6
+    
+    # 建立位置映射
+    for idx in range(n):
+        pos_buf[tour[idx]] = idx
+    
+    improved = False
+    use_dlb = (dlb_mask is not None)
+    
+    # 离散长度集合（segment B 的长度）
+    segment_lengths = np.array([1, 2, 3, 5, 8], dtype=np.int32)
+    
+    for _ in range(max_iters):
+        found_in_iter = False
+        start = np.random.randint(0, n)
+        
+        for offset in range(n):
+            i = (start + offset) % n
+            a = tour[i]
+            
+            if use_dlb and dlb_mask[a]:
+                continue
+            
+            # 限制：确保 k+1 不越界
+            if i >= n - 3:  # 至少需要 3 个点
+                continue
+            
+            b = tour[i + 1]  # segment A 的起点
+            
+            # 检查边 a->b 可行性
+            if not np.isfinite(D[a, b]):
+                continue
+            
+            move_found = False
+            
+            # 遍历 a 的 KNN 候选作为 d（segment B 的起点）
+            for k_idx in range(K):
+                d = knn_idx[a, k_idx]
+                if d == -1:
+                    break
+                
+                # 检查 a->d 新弧可行性
+                if not np.isfinite(D[a, d]):
+                    continue
+                
+                j_pos = pos_buf[d]
+                
+                # j 是 d 的前一个位置（segment A 的终点位置）
+                j = j_pos - 1
+                
+                # 确保 i < j < n-1
+                if j <= i or j >= n - 1:
+                    continue
+                
+                c = tour[j]  # segment A 的终点
+                
+                # 检查 c->d 边可行性
+                if not np.isfinite(D[c, d]):
+                    continue
+                
+                # 尝试不同的 segment B 长度
+                for seg_len in segment_lengths:
+                    k = j + seg_len
+                    
+                    # 确保 k < n-1（避免越界）
+                    if k >= n - 1:
+                        break
+                    
+                    e = tour[k]      # segment B 的终点
+                    f = tour[k + 1]  # segment B 之后
+                    
+                    # 检查新边可行性
+                    if not np.isfinite(D[e, f]) or not np.isfinite(D[e, b]) or not np.isfinite(D[c, f]):
+                        continue
+                    
+                    # 计算 delta
+                    # 旧弧: a->b, c->d, e->f
+                    # 新弧: a->d, e->b, c->f
+                    old_cost = D[a, b] + D[c, d] + D[e, f]
+                    new_cost = D[a, d] + D[e, b] + D[c, f]
+                    delta = new_cost - old_cost
+                    
+                    if delta < -eps:
+                        # 执行段交换：将 [B] 和 [A] 交换
+                        # segment A: tour[i+1 : j+1]
+                        # segment B: tour[j+1 : k+1]
+                        
+                        len_A = j - i
+                        len_B = k - j
+                        
+                        # 创建临时数组保存 segment A
+                        temp_A = np.empty(len_A, dtype=np.int32)
+                        for idx in range(len_A):
+                            temp_A[idx] = tour[i + 1 + idx]
+                        
+                        # 将 segment B 移到前面
+                        for idx in range(len_B):
+                            tour[i + 1 + idx] = tour[j + 1 + idx]
+                        
+                        # 将 segment A 放到后面
+                        for idx in range(len_A):
+                            tour[i + 1 + len_B + idx] = temp_A[idx]
+                        
+                        # 更新位置映射
+                        for idx in range(i + 1, k + 1):
+                            pos_buf[tour[idx]] = idx
+                        
+                        improved = True
+                        move_found = True
+                        found_in_iter = True
+                        
+                        # 更新 DLB
+                        if use_dlb:
+                            dlb_mask[a] = False
+                            dlb_mask[b] = False
+                            dlb_mask[c] = False
+                            dlb_mask[d] = False
+                            dlb_mask[e] = False
+                            dlb_mask[f] = False
+                            # 受影响的所有节点
+                            for idx in range(i + 1, k + 1):
+                                dlb_mask[tour[idx]] = False
+                        
+                        break  # 找到一个改进就跳出
+                
+                if move_found:
+                    break
+            
+            if move_found:
+                continue
+            else:
+                if use_dlb:
+                    dlb_mask[a] = True
+        
+        if not found_in_iter and use_dlb:
+            break
+    
+    return improved
+
+
+@njit(cache=True, fastmath=True)
 def _candidate_block_swap_jit(tour, D, knn_idx, pos_buf, tour_buf, max_iters=50, dlb_mask=None, block_size=2):
     """内存优化版 Block Swap：接收外部 buffer，零内存分配"""
     n = tour.shape[0]
@@ -1505,6 +1664,12 @@ def scout_worker(D, q_in, q_out, is_symmetric):
             dlb_mask[:], improved, block_steps = False, True, 10
             while improved:
                 improved = False; dlb_mask[:] = False
+                # ✅ Directed 3-opt (仅 ATSP)
+                if not is_symmetric:
+                    if _candidate_blockswap3_jit(candidate, D, knn_idx, pos_buffer, 1000, dlb_mask):
+                        improved = True
+                        continue
+                    dlb_mask[:] = False
                 # ✅ Candidate 2-opt (仅对称 TSP)
                 if is_symmetric:
                     if _candidate_2opt_jit(candidate, D, knn_idx, pos_buffer, 5000, dlb_mask):
@@ -1896,6 +2061,12 @@ class r0927480:
         improved = True
         while improved:
             improved = False; dlb_mask[:] = False
+            # ✅ Directed 3-opt (仅 ATSP)
+            if not is_symmetric:
+                if _candidate_blockswap3_jit(tour, D, knn_idx, pos_buf, 500, dlb_mask):
+                    improved = True
+                    continue
+                dlb_mask[:] = False
             # ✅ Candidate 2-opt (仅对称 TSP)
             if is_symmetric:
                 if _candidate_2opt_jit(tour, D, knn_idx, pos_buf, max_iters, dlb_mask):
@@ -1956,7 +2127,10 @@ class r0927480:
         # 这里故意做"反向"：选择让cost增加的2-opt
         n = len(corrupted)
         for _ in range(5):  # 尝试5次
-            i = self.rng.integers(0, n-1)
+            # 确保 i+2 < n，所以 i 最大为 n-3
+            if n < 3:
+                break  # 如果 n 太小，跳过
+            i = self.rng.integers(0, n-2)  # i 最大为 n-3
             j = self.rng.integers(i+2, n)
             
             # 检查2-opt后是否仍然可行
