@@ -297,7 +297,6 @@ def _eax_lite_atsp_inplace(pA, pB, D_eval, finite_mask, knn_idx, child,
     K_merge = 16     # subtour 合并扫描范围
     max_cycle_steps = 2 * n
     MIN_CYCLE_LEN = 4  # 最小合法 cycle 长度
-    TARGET_M = 3       # 目标构造数量
     MAX_M = 5          # 最大尝试次数
     
     # === 1. 构建父代有向邻接 ===
@@ -353,7 +352,7 @@ def _eax_lite_atsp_inplace(pA, pB, D_eval, finite_mask, knn_idx, child,
             for k in range(cycle_len):
                 cycle_u_buf[k] = temp_u_buf[k]
                 cycle_v_buf[k] = temp_v_buf[k]
-        elif abs(delta - best_delta) < 1e-12 and cycle_len > best_cycle_len:
+        elif np.abs(delta - best_delta) < 1e-12 and cycle_len > best_cycle_len:
             # delta 差不多，但 cycle 更长，优先选（更破结构）
             best_delta = delta
             best_cycle_len = cycle_len
@@ -1560,7 +1559,7 @@ def evolve_population_jit(population, c_pop, fitness, D, D_eval, finite_mask, kn
             # ==========================================
             
             # --- Child 1 ---
-            p_eax = 0.50  # EAX-lite 使用概率
+            p_eax = 0.80  # EAX-lite 使用概率
             
             if np.random.random() < p_eax:
                 # 尝试 EAX-lite
