@@ -278,8 +278,8 @@ def _eax_lite_atsp_inplace(pA, pB, D_eval, finite_mask, knn_idx, child,
     
     核心流程：
     1. 构建父代有向邻接
-    2. 构造 1 个 AB-cycle（候选表加速起点）
-    3. 应用 AB-cycle 交换
+    2. 尝试构造 M=3（最多5）个 AB-cycle，评估 delta，选最优
+    3. 应用选中的 AB-cycle 交换
     4. 提取 subtours 并用候选表合并
     5. 输出 tour + 可行性检查
     
@@ -296,19 +296,78 @@ def _eax_lite_atsp_inplace(pA, pB, D_eval, finite_mask, knn_idx, child,
     K0 = 16          # 判断边是否候选
     K_merge = 16     # subtour 合并扫描范围
     max_cycle_steps = 2 * n
+    MIN_CYCLE_LEN = 4  # 最小合法 cycle 长度
+    TARGET_M = 3       # 目标构造数量
+    MAX_M = 5          # 最大尝试次数
     
     # === 1. 构建父代有向邻接 ===
     _build_adjacency_atsp(pA, succA_buf, predA_buf)
     _build_adjacency_atsp(pB, succB_buf, predB_buf)
     
-    # === 2. 构造 AB-cycle（候选表加速起点）===
-    start = _find_abcycle_start_knn(succA_buf, succB_buf, knn_idx, K0, 16)
+    # === 2. 多 AB-cycle 构造与评估 ===
+    # 串行评估多个 AB-cycle，只保存最好的 cycle 的 u_buf 和 v_buf
+    # 完全零内存分配：使用外部预分配的 buffer
     
-    cycle_len = _construct_abcycle_atsp(start, succA_buf, predB_buf, 
-                                        cycle_u_buf, cycle_v_buf, max_cycle_steps)
+    best_cycle_idx = -1
+    best_delta = 1e30
+    best_cycle_len = 0
     
-    if cycle_len <= 0:
+    for attempt in range(MAX_M):
+        # 每次尝试都用 KNN 启发式找起点（提升 cycle 质量）
+        start = _find_abcycle_start_knn(succA_buf, succB_buf, knn_idx, K0, 16)
+        
+        # 使用临时 buffer 构造 cycle（使用 a_nodes_buf 和 b_nodes_buf）
+        temp_u_buf = a_nodes_buf
+        temp_v_buf = b_nodes_buf
+        
+        cycle_len = _construct_abcycle_atsp(start, succA_buf, predB_buf, 
+                                            temp_u_buf, temp_v_buf, max_cycle_steps)
+        
+        # 检查 cycle 长度是否合法
+        if cycle_len < MIN_CYCLE_LEN:
+            continue  # 过短，丢弃重试
+        
+        # 计算 delta = B 边和 - A 边和
+        delta = 0.0
+        for k in range(cycle_len):
+            u = temp_u_buf[k]
+            v = temp_v_buf[k]
+            # A 边：u -> v
+            a_edge_cost = D_eval[u, v]
+            
+            # B 边：对应的是 u_{k+1} -> v_k
+            u_next_idx = (k + 1) % cycle_len
+            u_next = temp_u_buf[u_next_idx]
+            v_k = temp_v_buf[k]
+            b_edge_cost = D_eval[u_next, v_k]
+            
+            delta += (b_edge_cost - a_edge_cost)
+        
+        # 更新最优 cycle（带 tie-break：delta 接近时优先选更长的 cycle）
+        if delta < best_delta - 1e-12:
+            # delta 明显更好，直接更新
+            best_delta = delta
+            best_cycle_len = cycle_len
+            best_cycle_idx = attempt
+            # 保存最优 cycle 到 cycle_u_buf 和 cycle_v_buf
+            for k in range(cycle_len):
+                cycle_u_buf[k] = temp_u_buf[k]
+                cycle_v_buf[k] = temp_v_buf[k]
+        elif abs(delta - best_delta) < 1e-12 and cycle_len > best_cycle_len:
+            # delta 差不多，但 cycle 更长，优先选（更破结构）
+            best_delta = delta
+            best_cycle_len = cycle_len
+            best_cycle_idx = attempt
+            # 保存最优 cycle 到 cycle_u_buf 和 cycle_v_buf
+            for k in range(cycle_len):
+                cycle_u_buf[k] = temp_u_buf[k]
+                cycle_v_buf[k] = temp_v_buf[k]
+    
+    # 检查是否找到合法的 cycle
+    if best_cycle_idx < 0:
         return 1  # AB-cycle 构造失败
+    
+    cycle_len = best_cycle_len
     
     # === 3. 应用 AB-cycle 交换 ===
     # 初始化 out = succA
@@ -1943,7 +2002,7 @@ class r0927482:
         n = distanceMatrix.shape[0]
         lam, stagnation_limit, exploit_mut, exploit_ls = 200, 200, 0.3, 30
         if n < 300: lam, stagnation_limit = 1000, 500
-        elif n < 600: lam, stagnation_limit, exploit_mut, exploit_ls = 300, 150, 0.15, 30
+        elif n < 600: lam, stagnation_limit, exploit_mut, exploit_ls = 250, 150, 0.15, 30
         elif n < 850: lam, stagnation_limit, exploit_mut, exploit_ls = 200, 150, 0.25, 20
         else: lam, stagnation_limit, exploit_mut, exploit_ls = 80, 100, 0.25, 20
         
