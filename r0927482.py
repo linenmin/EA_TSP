@@ -1501,7 +1501,7 @@ def evolve_population_jit(population, c_pop, fitness, D, D_eval, finite_mask, kn
             # ==========================================
             
             # --- Child 1 ---
-            p_eax = 0.30  # EAX-lite 使用概率
+            p_eax = 0.50  # EAX-lite 使用概率
             
             if np.random.random() < p_eax:
                 # 尝试 EAX-lite
@@ -1944,7 +1944,7 @@ class r0927482:
         lam, stagnation_limit, exploit_mut, exploit_ls = 200, 200, 0.3, 30
         if n < 300: lam, stagnation_limit = 1000, 500
         elif n < 600: lam, stagnation_limit, exploit_mut, exploit_ls = 300, 150, 0.15, 30
-        elif n < 850: lam, stagnation_limit, exploit_mut, exploit_ls = 120, 150, 0.25, 30
+        elif n < 850: lam, stagnation_limit, exploit_mut, exploit_ls = 200, 150, 0.25, 20
         else: lam, stagnation_limit, exploit_mut, exploit_ls = 80, 100, 0.25, 20
         
         D = np.ascontiguousarray(distanceMatrix)
@@ -2006,9 +2006,9 @@ class r0927482:
                 
                 # === 精英 VND：根据停滞度自适应调整强度 ===
                 # 前期快速下降时用轻量算子，后期停滞时用重型算子
-                if stagnation_counter < 30:
+                if stagnation_counter < stagnation_limit*0.3 :
                     vnd_level = 0  # 轻量级：Or-opt(1) + 2-opt/Or-opt(2)
-                elif stagnation_counter < 100:
+                elif stagnation_counter < stagnation_limit*0.8 : 
                     vnd_level = 1  # 标准级：+ Or-opt(3) + Block swap(2)
                 else:
                     vnd_level = 2  # 重型级：+ Directed 3-opt
