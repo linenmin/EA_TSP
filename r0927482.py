@@ -157,7 +157,8 @@ def _extract_subtours(out, mark_buf, cycle_ids_buf):
 
 @njit(cache=True, fastmath=True)
 def _merge_two_subtours_knn(out, mark_buf, cycle_a_id, cycle_b_id, 
-                            cycle_ids_buf, D_eval, finite_mask, knn_idx, K_merge):
+                            cycle_ids_buf, D_eval, finite_mask, knn_idx, K_merge,
+                            a_nodes_buf, b_nodes_buf):
     """
     用候选表加速合并两个 subtours
     
@@ -165,13 +166,15 @@ def _merge_two_subtours_knn(out, mark_buf, cycle_a_id, cycle_b_id,
     - 从 cycle_a 选一个节点 a，从 cycle_b 的 KNN 里选节点 b
     - 2-edge reconnect：删 (a->a_next, b->b_next)，加 (a->b_next, b->a_next)
     
+    Args:
+        a_nodes_buf, b_nodes_buf: 外部预分配的临时buffer（避免内存分配）
+    
     Returns:
         True 表示成功合并
     """
     n = len(out)
     
-    # 收集 cycle_a 的所有节点（用于枚举 a）
-    a_nodes_buf = np.empty(n, dtype=np.int32)
+    # 收集 cycle_a 的所有节点（用外部buffer，零分配）
     a_count = 0
     for i in range(n):
         if mark_buf[i] == cycle_a_id:
@@ -218,7 +221,7 @@ def _merge_two_subtours_knn(out, mark_buf, cycle_a_id, cycle_b_id,
     
     # 如果 KNN 没找到，随机从 cycle_b 抽几个试试
     if best_a == -1:
-        b_nodes_buf = np.empty(n, dtype=np.int32)
+        # 收集 cycle_b 的所有节点（用外部buffer，零分配）
         b_count = 0
         for i in range(n):
             if mark_buf[i] == cycle_b_id:
@@ -269,9 +272,9 @@ def _merge_two_subtours_knn(out, mark_buf, cycle_a_id, cycle_b_id,
 def _eax_lite_atsp_inplace(pA, pB, D_eval, finite_mask, knn_idx, child,
                            succA_buf, predA_buf, succB_buf, predB_buf,
                            out_buf, mark_buf, cycle_u_buf, cycle_v_buf, 
-                           nodes_buf):
+                           nodes_buf, a_nodes_buf, b_nodes_buf, cycle_ids_temp_buf):
     """
-    EAX-lite for ATSP (JIT)
+    EAX-lite for ATSP (JIT) - 完全零内存分配版本
     
     核心流程：
     1. 构建父代有向邻接
@@ -279,6 +282,9 @@ def _eax_lite_atsp_inplace(pA, pB, D_eval, finite_mask, knn_idx, child,
     3. 应用 AB-cycle 交换
     4. 提取 subtours 并用候选表合并
     5. 输出 tour + 可行性检查
+    
+    Args:
+        所有 buffer 均为外部预分配，确保零内存分配
     
     Returns:
         0: 成功（child 已写入）
@@ -313,22 +319,21 @@ def _eax_lite_atsp_inplace(pA, pB, D_eval, finite_mask, knn_idx, child,
     # === 4. 提取 subtours ===
     cycle_count = _extract_subtours(out_buf, mark_buf, nodes_buf)
     
-    # === 5. 合并 subtours（候选表加速）===
+    # === 5. 合并 subtours（候选表加速，零分配）===
     # 合并策略：每次把最小 cycle_id 的两个 cycle 合并
     while cycle_count > 1:
-        # 找到存在的最小两个 cycle_id
-        cycle_ids = np.empty(cycle_count, dtype=np.int32)
+        # 找到存在的最小两个 cycle_id（用外部buffer，零分配）
         cnt = 0
         for i in range(n):
             cid = mark_buf[i]
             if cid >= 0:
                 found = False
                 for j in range(cnt):
-                    if cycle_ids[j] == cid:
+                    if cycle_ids_temp_buf[j] == cid:
                         found = True
                         break
                 if not found:
-                    cycle_ids[cnt] = cid
+                    cycle_ids_temp_buf[cnt] = cid
                     cnt += 1
                     if cnt >= cycle_count:
                         break
@@ -336,11 +341,12 @@ def _eax_lite_atsp_inplace(pA, pB, D_eval, finite_mask, knn_idx, child,
         if cnt < 2:
             return 2  # 只剩一个或没有 cycle，理论上不会发生
         
-        # 合并 cycle_ids[0] 和 cycle_ids[1]
+        # 合并 cycle_ids_temp_buf[0] 和 cycle_ids_temp_buf[1]
         success = _merge_two_subtours_knn(out_buf, mark_buf, 
-                                          cycle_ids[0], cycle_ids[1],
+                                          cycle_ids_temp_buf[0], cycle_ids_temp_buf[1],
                                           nodes_buf, D_eval, finite_mask, 
-                                          knn_idx, K_merge)
+                                          knn_idx, K_merge,
+                                          a_nodes_buf, b_nodes_buf)
         
         if not success:
             return 2  # subtour 合并失败
@@ -1404,15 +1410,38 @@ def evolve_population_jit(population, c_pop, fitness, D, D_eval, finite_mask, kn
     cycle_u_buf = np.empty(n, dtype=np.int32)
     cycle_v_buf = np.empty(n, dtype=np.int32)
     nodes_buf = np.empty(n, dtype=np.int32)
+    # EAX-lite 额外 buffers（消除隐形内存分配）
+    a_nodes_eax_buf = np.empty(n, dtype=np.int32)
+    b_nodes_eax_buf = np.empty(n, dtype=np.int32)
+    cycle_ids_buf = np.empty(n, dtype=np.int32)
         
     SCX_RETRY = 3  # ATSP 重试次数
     
     for i in range(0, lam, 2):
-        # 锦标赛选择 (保留原有逻辑)
-        cand1 = np.random.choice(lam, 5, replace=False)
-        p1 = population[cand1[np.argmin(fitness[cand1])]]
-        cand2 = np.random.choice(lam, 5, replace=False)
-        p2 = population[cand2[np.argmin(fitness[cand2])]]
+        # === 优化的锦标赛选择（避免慢速的 np.random.choice） ===
+        # ATSP: 用较小锦标赛（3）增加多样性，避免近亲繁殖
+        # 对称TSP: 用较大锦标赛（5）保持选择压力
+        tournament_size = 3 if not is_symmetric else 5
+        
+        # 父代 1：连续 randint（允许重复，比 choice 快很多）
+        best_idx1 = np.random.randint(0, lam)
+        best_fit1 = fitness[best_idx1]
+        for _ in range(tournament_size - 1):
+            idx = np.random.randint(0, lam)
+            if fitness[idx] < best_fit1:
+                best_idx1 = idx
+                best_fit1 = fitness[idx]
+        p1 = population[best_idx1]
+        
+        # 父代 2
+        best_idx2 = np.random.randint(0, lam)
+        best_fit2 = fitness[best_idx2]
+        for _ in range(tournament_size - 1):
+            idx = np.random.randint(0, lam)
+            if fitness[idx] < best_fit2:
+                best_idx2 = idx
+                best_fit2 = fitness[idx]
+        p2 = population[best_idx2]
         
         c1 = c_pop[i]
         c2 = c_pop[i+1]
@@ -1479,7 +1508,7 @@ def evolve_population_jit(population, c_pop, fitness, D, D_eval, finite_mask, kn
                 eax_result = _eax_lite_atsp_inplace(p1, p2, D_eval, finite_mask, knn_idx, c1,
                                                      succA_buf, predA_buf, succB_buf, predB_buf,
                                                      out_buf, mark_buf, cycle_u_buf, cycle_v_buf, 
-                                                     nodes_buf)
+                                                     nodes_buf, a_nodes_eax_buf, b_nodes_eax_buf, cycle_ids_buf)
                 
                 if eax_result != 0:
                     # EAX-lite 失败，fallback to SCX
@@ -1637,7 +1666,7 @@ def evolve_population_jit(population, c_pop, fitness, D, D_eval, finite_mask, kn
                 eax_result = _eax_lite_atsp_inplace(p2, p1, D_eval, finite_mask, knn_idx, c2,
                                                      succA_buf, predA_buf, succB_buf, predB_buf,
                                                      out_buf, mark_buf, cycle_u_buf, cycle_v_buf, 
-                                                     nodes_buf)
+                                                     nodes_buf, a_nodes_eax_buf, b_nodes_eax_buf, cycle_ids_buf)
                 
                 if eax_result != 0:
                     # EAX-lite 失败，fallback to SCX
@@ -2105,12 +2134,12 @@ class r0927482:
             
             # 2. 对称TSP用2-opt，ATSP用Or-opt(2)
             if is_symmetric:
-                if _candidate_2opt_jit(tour, D, knn_idx, pos_buf, max_iters*5, dlb_mask):
+                if _candidate_2opt_jit(tour, D, knn_idx, pos_buf, max_iters*3, dlb_mask):
                     improved = True
                     continue
             else:
                 # ATSP: Or-opt(2)
-                if _candidate_or_opt_jit(tour, D, knn_idx, pos_buf, tour_buf, block_steps*10, dlb_mask, 2): 
+                if _candidate_or_opt_jit(tour, D, knn_idx, pos_buf, tour_buf, block_steps*5, dlb_mask, 2): 
                     improved = True
                     continue
             
@@ -2118,12 +2147,12 @@ class r0927482:
             if vnd_level >= 1:
                 # ATSP: Or-opt(3)
                 if not is_symmetric:
-                    if _candidate_or_opt_jit(tour, D, knn_idx, pos_buf, tour_buf, block_steps*10, dlb_mask, 3): 
+                    if _candidate_or_opt_jit(tour, D, knn_idx, pos_buf, tour_buf, block_steps*5, dlb_mask, 3): 
                         improved = True
                         continue
                 
                 # 3. Block swap(2)
-                if _candidate_block_swap_jit(tour, D, knn_idx, pos_buf, tour_buf, block_steps*5, dlb_mask, 2): 
+                if _candidate_block_swap_jit(tour, D, knn_idx, pos_buf, tour_buf, block_steps*10, dlb_mask, 2): 
                     improved = True
                     continue
             
