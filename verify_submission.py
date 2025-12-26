@@ -7,7 +7,7 @@ import r0927482
 def test_run():
     
     print("Initializing solver...")
-    solver = r0927482.r0927480()
+    solver = r0927482.r0927482()
     print("Running optimize...")
     solver.optimize("tour1000.csv")
     print("Done.")
