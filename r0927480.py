@@ -1644,7 +1644,7 @@ def scout_worker(D, q_in, q_out, is_symmetric, n):
             
             dlb_mask[:], improved, block_steps = False, True, n // 20
             while improved:
-                improved = False; dlb_mask[:] = False
+                improved = False; 
                 
                 # === Level 0+: 基础算子 ===
                 # 1. Or-opt(1) - 最快，清理单点
