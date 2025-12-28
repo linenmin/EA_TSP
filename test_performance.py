@@ -974,6 +974,22 @@ def bond_distance_jit(t1, t2, pos_buf):
     return n - shared_edges
 
 @njit(cache=True, fastmath=True)
+def population_diversity_jit(pop, pos_buf):
+    """计算种群平均 bond distance（采样法，O(lam*K)）"""
+    lam, n = pop.shape
+    K = min(10, lam - 1)  # 每个个体随机采样10个对比
+    total_dist = 0.0
+    count = 0
+    for i in range(lam):
+        for _ in range(K):
+            j = np.random.randint(0, lam)
+            if j != i:
+                dist = bond_distance_jit(pop[i], pop[j], pos_buf)
+                total_dist += dist
+                count += 1
+    return total_dist / count if count > 0 else 0.0
+
+@njit(cache=True, fastmath=True)
 def rtr_challenge_jit(child, child_fit, pop, fit, W, best_idx, rtr_pos_buf, rtr_win_buf):
     """RTR 挑战函数 (零内存分配版本)"""
     m, n = pop.shape[0], child.shape[0]
@@ -1211,7 +1227,7 @@ def init_population_jit(pop, D, finite_mask, knn_idx, strat_probs, seeds, rcl_r)
         pop[i] = tour
 
 @njit(cache=True)
-def evolve_population_jit(population, c_pop, fitness, D, D_eval, finite_mask, knn_idx, exploit_mut, is_symmetric, buffers):
+def evolve_population_jit(population, c_pop, fitness, D, D_eval, finite_mask, knn_idx, exploit_mut, is_symmetric, buffers, use_eax=True):
     lam, n = population.shape    
     
     # === 解包 Buffers (外部预分配，零内存分配) ===
@@ -1222,6 +1238,11 @@ def evolve_population_jit(population, c_pop, fitness, D, D_eval, finite_mask, kn
      cycle_ids_buf, rtr_pos_buf, rtr_win_buf) = buffers
         
     SCX_RETRY = 3  # ATSP 重试次数
+    
+    # === 性能统计计数器 ===
+    eax_attempts = 0
+    eax_success = 0
+    scx_fallback = 0
     
     for i in range(0, lam, 2):
         # === 优化的锦标赛选择（避免慢速的 np.random.choice） ===
@@ -1291,17 +1312,22 @@ def evolve_population_jit(population, c_pop, fitness, D, D_eval, finite_mask, kn
                 c2[:] = p2[:]
 
         else:
-            p_eax = 0.80  # EAX-lite 使用概率
+            # 【消融实验】可配置 EAX 使用
+            p_eax = 0.80 if use_eax else 0.0  # EAX-lite 使用概率
             
             if np.random.random() < p_eax:
                 # 尝试 EAX-lite
+                eax_attempts += 1
                 eax_result = _eax_lite_atsp_inplace(p1, p2, D_eval, finite_mask, knn_idx, c1,
                                                      succA_buf, predA_buf, succB_buf, predB_buf,
                                                      out_buf, mark_buf, cycle_u_buf, cycle_v_buf, 
                                                      nodes_buf, a_nodes_eax_buf, b_nodes_eax_buf, cycle_ids_buf)
                 
-                if eax_result != 0:
+                if eax_result == 0:
+                    eax_success += 1
+                else:
                     # EAX-lite 失败，fallback to SCX
+                    scx_fallback += 1
                     result1 = 0
                     for _ in range(SCX_RETRY):
                         result1 = _scx_jit_inplace_ok(p1, p2, D_eval, finite_mask, knn_idx, c1, 
@@ -1588,6 +1614,8 @@ def evolve_population_jit(population, c_pop, fitness, D, D_eval, finite_mask, kn
                                     c2[v] = city
                                     if not _tour_feasible_jit(c2, finite_mask):
                                         c2[:] = backup_buf[:]
+    
+    return eax_attempts, eax_success, scx_fallback
 
 def scout_worker(D, q_in, q_out, is_symmetric, n):
     try:
@@ -1690,14 +1718,34 @@ def scout_worker(D, q_in, q_out, is_symmetric, n):
     except Exception: pass
 
 class r0927480:
-    def __init__(self):
+    def __init__(self, config=None):
+        """初始化求解器
+        
+        Args:
+            config: 消融实验配置字典，支持以下选项：
+                - use_eax: 是否使用 EAX Lite 交叉（默认 True）
+                - use_scout: 是否启动 Scout 进程（默认 True）
+                - use_rtr: 是否使用 RTR 替换策略（默认 True）
+                - use_gls: 是否使用 GLS 惩罚机制（默认 True）
+        """
         self.reporter = Reporter.Reporter(self.__class__.__name__)
         self.rng = np.random.default_rng()
+        
+        # 默认配置：启用所有组件
+        self.config = {
+            'use_eax': True,
+            'use_scout': True,
+            'use_rtr': True,
+            'use_gls': True,
+        }
+        # 更新用户提供的配置
+        if config is not None:
+            self.config.update(config)
 
     def optimize(self, filename):
         with open(filename) as f: distanceMatrix = np.loadtxt(f, delimiter=",")
         n = distanceMatrix.shape[0]
-        params = {300: (1000, 500, 0.3, 30), 600: (250, 150, 0.15, 30), 850: (150, 200, 0.15, 20)}
+        params = {300: (1000, 500, 0.3, 30), 600: (250, 150, 0.15, 30), 850: (200, 200, 0.15, 20)}
         lam, stagnation_limit, exploit_mut, exploit_ls = 80, 100, 0.25, 20
         for limit, p in params.items():
             if n < limit: lam, stagnation_limit, exploit_mut, exploit_ls = p; break
@@ -1706,9 +1754,13 @@ class r0927480:
         finite_mask = np.isfinite(D); np.fill_diagonal(finite_mask, False)
         strat_probs = np.array([0.1, 0.3, 0.6] if is_symmetric else [0.7, 0.3, 0.0], dtype=np.float64)
         
-        q_to_scout, q_from_scout = multiprocessing.Queue(maxsize=5), multiprocessing.Queue(maxsize=5)
-        scout_process = multiprocessing.Process(target=scout_worker, args=(distanceMatrix, q_to_scout, q_from_scout, is_symmetric, n))
-        scout_process.start()
+        # 【消融实验】可配置 Scout 进程启动
+        scout_process = None
+        q_to_scout, q_from_scout = None, None
+        if self.config['use_scout']:
+            q_to_scout, q_from_scout = multiprocessing.Queue(maxsize=5), multiprocessing.Queue(maxsize=5)
+            scout_process = multiprocessing.Process(target=scout_worker, args=(distanceMatrix, q_to_scout, q_from_scout, is_symmetric, n))
+            scout_process.start()
 
         try:
             knn_idx = build_knn_idx(D, finite_mask, 64)
@@ -1739,24 +1791,39 @@ class r0927480:
                 np.empty(n, dtype=np.int32), np.empty(100, dtype=np.int32) # rtr_pos_buf, rtr_win_buf
             )
 
+            # === 性能分析指标 ===
+            perf_metrics = {
+                'history_time': [], 'history_mean': [], 'history_best': [], 'history_diversity': [],
+                'scout_sent': 0, 'scout_received': 0, 'scout_improved': 0,
+                'eax_attempts': 0, 'eax_success': 0, 'scx_fallback': 0,
+                'rtr_accepts': 0, 'rtr_rejects': 0,
+                'gls_activations': 0, 'restart_count': 0,
+            }
+            perf_start_time = time.time()
 
             while True:
                 gen += 1                
-                # Scout Check
-                try:
-                    healed = q_from_scout.get_nowait()
-                    h_fit = tour_length_jit(healed, D)
-                    
-                    worst_idx = np.argmax(fitness)
-                    population[worst_idx][:], fitness[worst_idx] = healed[:], h_fit
-                    if h_fit < best_ever_fitness:
-                        best_ever_fitness, stagnation_counter, gls_penalties[:], gls_active = h_fit, 0, 0, False
-                except queue.Empty: pass
+                # 【消融实验】Scout Check - 仅在启用时检查
+                if self.config['use_scout']:
+                    try:
+                        healed = q_from_scout.get_nowait()
+                        perf_metrics['scout_received'] += 1
+                        h_fit = tour_length_jit(healed, D)
+                        
+                        worst_idx = np.argmax(fitness)
+                        population[worst_idx][:], fitness[worst_idx] = healed[:], h_fit
+                        if h_fit < best_ever_fitness:
+                            perf_metrics['scout_improved'] += 1
+                            best_ever_fitness, stagnation_counter, gls_penalties[:], gls_active = h_fit, 0, 0, False
+                    except queue.Empty: pass
 
                 
                 D_ls = D_gls if (gls_active and D_gls is not None) else D
-                # 传递预分配的 buffers
-                evolve_population_jit(population, c_pop, fitness, D, D_ls, finite_mask, knn_idx, exploit_mut, is_symmetric, evo_buffers)
+                # 传递预分配的 buffers 并收集统计（【消融实验】传递 use_eax 配置）
+                eax_att, eax_suc, scx_fb = evolve_population_jit(population, c_pop, fitness, D, D_ls, finite_mask, knn_idx, exploit_mut, is_symmetric, evo_buffers, self.config['use_eax'])
+                perf_metrics['eax_attempts'] += eax_att
+                perf_metrics['eax_success'] += eax_suc
+                perf_metrics['scx_fallback'] += scx_fb
                 
                 batch_lengths_jit(c_pop, D, c_fit)
 
@@ -1782,12 +1849,24 @@ class r0927480:
                 
                 
                 cur_best_idx = np.argmin(fitness)
-                # 解包 RTR 所需的 buffers (第16和17个元素)
-                rtr_pos_buf = evo_buffers[16]
-                rtr_win_buf = evo_buffers[17]
-                for i in range(lam):
-                    better, tidx = rtr_challenge_jit(c_pop[i], c_fit[i], population, fitness, min(lam, 50), cur_best_idx, rtr_pos_buf, rtr_win_buf)
-                    if better: population[tidx][:], fitness[tidx] = c_pop[i][:], c_fit[i]
+                # 【消融实验】可配置 RTR 替换策略
+                if self.config['use_rtr']:
+                    # 使用 RTR 挑战
+                    rtr_pos_buf = evo_buffers[16]
+                    rtr_win_buf = evo_buffers[17]
+                    for i in range(lam):
+                        better, tidx = rtr_challenge_jit(c_pop[i], c_fit[i], population, fitness, min(lam, 50), cur_best_idx, rtr_pos_buf, rtr_win_buf)
+                        if better:
+                            population[tidx][:], fitness[tidx] = c_pop[i][:], c_fit[i]
+                            perf_metrics['rtr_accepts'] += 1
+                        else:
+                            perf_metrics['rtr_rejects'] += 1
+                else:
+                    # 简单的最差替换策略
+                    for i in range(lam):
+                        worst_idx = np.argmax(fitness)
+                        if c_fit[i] < fitness[worst_idx]:
+                            population[worst_idx][:], fitness[worst_idx] = c_pop[i][:], c_fit[i]
                 
                 best_idx = np.argmin(fitness); bestObjective = float(fitness[best_idx])
                 
@@ -1803,22 +1882,32 @@ class r0927480:
                     stagnation_counter = 0  # 打破历史记录当然也清零
                     gls_penalties[:], gls_active = 0, False
                 
-                if stagnation_counter > (stagnation_limit // 5) and (time.time() - last_patient_sent_time > 5.0):
-                    try: q_to_scout.put_nowait(population[best_idx].copy()); last_patient_sent_time = time.time()
+                # 【消融实验】Scout 发送 - 仅在启用时发送
+                if self.config['use_scout'] and stagnation_counter > (stagnation_limit // 5) and (time.time() - last_patient_sent_time > 5.0):
+                    try:
+                        q_to_scout.put_nowait(population[best_idx].copy())
+                        perf_metrics['scout_sent'] += 1
+                        last_patient_sent_time = time.time()
                     except queue.Full: pass
                 
-                if stagnation_counter >= max(30, int(stagnation_limit * 0.2)):
+                # 【消融实验】GLS 激活 - 仅在启用时激活
+                if self.config['use_gls'] and stagnation_counter >= max(30, int(stagnation_limit * 0.2)):
+                    if not gls_active:
+                        perf_metrics['gls_activations'] += 1
                     gls_active = True
                     if gen % 5 == 0:
                         _gls_update_penalties_jit(population[best_idx], D, gls_penalties)
                         D_gls = np.ascontiguousarray(D + (0.03 * (bestObjective / n)) * gls_penalties)
-                else: gls_active = False
+                elif self.config['use_gls']:  # 只有在启用 GLS 时才会设置为 False
+                    gls_active = False
                 
-                if stagnation_counter >= stagnation_limit:                    
-                    # 1. 清空 Scout 发回的旧消息
-                    while not q_from_scout.empty():
-                        try: q_from_scout.get_nowait()
-                        except queue.Empty: break
+                if stagnation_counter >= stagnation_limit:
+                    perf_metrics['restart_count'] += 1
+                    # 1. 清空 Scout 发回的旧消息（仅在启用时）
+                    if self.config['use_scout']:
+                        while not q_from_scout.empty():
+                            try: q_from_scout.get_nowait()
+                            except queue.Empty: break
                     
                     # 2. 彻底的 GLS 遗忘
                     gls_penalties[:] = 0
@@ -1846,18 +1935,27 @@ class r0927480:
                         population[i] = mutated
                     
                     batch_lengths_jit(population, D, fitness)                    
-                    # 4. 让 Scout 也同步到新区域
-                    try:
-                        q_to_scout.put_nowait(population[np.argmin(fitness)].copy())
-                    except queue.Full:
+                    # 4. 让 Scout 也同步到新区域（仅在启用时）
+                    if self.config['use_scout']:
                         try:
-                            q_to_scout.get_nowait()
                             q_to_scout.put_nowait(population[np.argmin(fitness)].copy())
-                        except: pass
+                        except queue.Full:
+                            try:
+                                q_to_scout.get_nowait()
+                                q_to_scout.put_nowait(population[np.argmin(fitness)].copy())
+                            except: pass
                     
                     # 5. 重置本轮最优和停滞计数器
                     current_run_best = fitness.min()  # 让新种群从新起点开始计算
                     stagnation_counter = 0
+
+                # === 收集历史数据（每 10 代记录一次） ===
+                if gen % 10 == 0:
+                    perf_metrics['history_time'].append(time.time() - perf_start_time)
+                    perf_metrics['history_mean'].append(float(fitness.mean()))
+                    perf_metrics['history_best'].append(best_ever_fitness)
+                    diversity = population_diversity_jit(population, main_pos_buffer)
+                    perf_metrics['history_diversity'].append(diversity)
 
                 # 报告时使用全局最优解 best_tour_ever
                 start_pos = np.where(best_tour_ever == 0)[0]
@@ -1865,9 +1963,19 @@ class r0927480:
                 
                 if self.reporter.report(float(fitness.mean()), best_ever_fitness, bestSolution) < 0:
                     break
-            return 0
+            
+            # 返回结构化结果
+            return {
+                'best_fitness': best_ever_fitness,
+                'best_tour': best_tour_ever.copy(),
+                'generations': gen,
+                'metrics': perf_metrics
+            }
         finally:
-            if scout_process.is_alive(): scout_process.terminate(); scout_process.join()
+            # 【消融实验】仅在启动了 Scout 时才终止
+            if scout_process is not None and scout_process.is_alive(): 
+                scout_process.terminate()
+                scout_process.join()
 
     def _vnd_or_opt_inplace(self, tour, D, knn_idx, dlb_mask, max_iters, block_steps, pos_buf, tour_buf, is_symmetric, vnd_level=1):
         dlb_mask[:] = False
